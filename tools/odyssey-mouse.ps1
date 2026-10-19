@@ -38,7 +38,7 @@
     powershell -ExecutionPolicy Bypass -File tools\odyssey-mouse.ps1 -InvertY:$false # 上下を逆にしたい場合
 
   メモ: Y 軸は実機の向きに合わせて既定で反転（スティック・タッチパッド共通）。
-        起動時にスティック中心を自動校准する（実機の静止値は 2048 からずれる）。
+        起動時にスティック中心を自動較正する（実機の静止値は 2048 からずれる）。
 #>
 [CmdletBinding()]
 param(
@@ -407,7 +407,7 @@ if ($TestHaptics) {
     exit 0
 }
 
-# ---- スティック中心の確定（実機は静止時の値が 2048 からずれるため自動校准する） ----
+# ---- スティック中心の確定（実機は静止時の値が 2048 からずれるため自動較正する） ----
 $cx = 2048.0; $cy = 2048.0
 if ($StickCenterX -ne 0 -or $StickCenterY -ne 0) {
     $cx = [double]$StickCenterX; $cy = [double]$StickCenterY

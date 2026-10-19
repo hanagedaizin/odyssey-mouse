@@ -18,7 +18,7 @@ Windows 標準の入力 API（`SendInput`）でカーソル・クリック・ス
 1. `OdysseyMouseSetup.exe` を実行（UAC なし・スタートメニューとデスクトップにショートカットを作成）
 2. コントローラを Windows の **Bluetooth 設定**で「Motion controller」として接続
 3. 「Odyssey Mouse」を起動し、コントローラの **Windows ボタン**を押す
-   → 自動で中心を校准して開始します（画面上部の状態が「接続中」になれば OK）
+   → 自動で中心位置を調整して開始します（画面上部の状態が「接続中」になれば OK）
 
 アンインストールはスタートメニューの「Odyssey Mouse」→「Odyssey Mouse をアンインストール」。
 設定は `%APPDATA%\OdysseyMouse\settings.ini` に残るので、入れ直しても好みが引き継がれます。
