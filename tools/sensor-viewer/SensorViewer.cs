@@ -383,11 +383,46 @@ namespace SensorViewer
         public double GyroFactor = 1.0;      // スケール見直し用（[ / ] キー）
         public double AccGain = 2.0;         // 重力補正の強さ (1/秒, τ ≒ 0.5 秒)
 
+        // --- コンパス（地磁気）による yaw 補正 ---
+        public bool MagYaw = true;           // 既定 ON（M キーで切替）
+        public double MagGain = 0.5;         // yaw 補正の強さ (1/秒, τ ≒ 2 秒)
+        public double MagWorldAz;            // 世界座標での磁気方位 [rad]（ノックに使う）
+        public bool MagRefInit { get { return _psiRefInit; } }
+        double _psiRef;                      // 基準となる磁気方位 [rad]
+        bool _psiRefInit;
+
         double _bx, _by, _bz;                // ジャイロのバイアス (counts)
         double _lastT = -1.0;
 
         public void SetBias(double x, double y, double z) { _bx = x; _by = y; _bz = z; }
-        public void Reset() { W = 1; Xq = Yq = Zq = 0; _lastT = -1; }
+        public void Reset() { W = 1; Xq = Yq = Zq = 0; _lastT = -1; _psiRefInit = false; }
+        public void ResetMagRef() { _psiRefInit = false; }
+
+        /// <summary>体の前向き（+X 軸）の世界方位 [deg]。Z=上 のため XY 面の角。</summary>
+        public double YawDeg
+        {
+            get
+            {
+                double fx, fy, fz;
+                Rotate(out fx, out fy, out fz, 1, 0, 0);
+                double d = Math.Atan2(fy, fx) * 180.0 / Math.PI;
+                while (d < 0) d += 360; while (d >= 360) d -= 360;
+                return d;
+            }
+        }
+
+        static double WrapPi(double a)
+        {
+            while (a > Math.PI) a -= 2 * Math.PI;
+            while (a < -Math.PI) a += 2 * Math.PI;
+            return a;
+        }
+
+        void Normalize()
+        {
+            double n = Math.Sqrt(W * W + Xq * Xq + Yq * Yq + Zq * Zq);
+            if (n > 1e-9) { W /= n; Xq /= n; Yq /= n; Zq /= n; }
+        }
 
         /// <summary>1 サンプルぶん回す。countsPerDps は「1 deg/s が何 counts か」。</summary>
         public void Update(Sample s, double countsPerDps)
@@ -423,8 +458,34 @@ namespace SensorViewer
             Xq = qx + 0.5 * ( qw * gx + qy * gz - qz * gy) * dt;
             Yq = qy + 0.5 * ( qw * gy - qx * gz + qz * gx) * dt;
             Zq = qz + 0.5 * ( qw * gz + qx * gy - qy * gx) * dt;
-            double n = Math.Sqrt(W * W + Xq * Xq + Yq * Yq + Zq * Zq);
-            if (n > 1e-9) { W /= n; Xq /= n; Yq /= n; Zq /= n; }
+            Normalize();
+
+            // --- コンパスによる yaw 補正（世界 Z=上 なので水平回りだけ直す。傾きには影響しない） ---
+            // 世界座標に写した磁気方位が基準方位のままなら yaw はドリフトしていない。
+            // 地磁気はハードアイアン未補正なので誤差はあるが、無限ドリフトは防げる。
+            if (s.HasMag)
+            {
+                double mx, my, mz;
+                Rotate(out mx, out my, out mz, s.Mx, s.My, s.Mz);   // 体 → 世界
+                double magLen = Math.Sqrt(mx * mx + my * my + mz * mz);
+                if (magLen > 1e-6)
+                {
+                    MagWorldAz = Math.Atan2(my, mx);
+                    if (!_psiRefInit) { _psiRef = MagWorldAz; _psiRefInit = true; }   // 初回を基準にする
+                    if (MagYaw)
+                    {
+                        double err = WrapPi(MagWorldAz - _psiRef);
+                        double d = -err * MagGain * dt;             // 世界 Z 軸まわりの微小回転
+                        double hw = Math.Cos(d / 2), hz = Math.Sin(d / 2);
+                        double nw = hw * W - hz * Zq;
+                        double nx = hw * Xq - hz * Yq;
+                        double ny = hw * Yq + hz * Xq;
+                        double nz = hw * Zq + hz * W;
+                        W = nw; Xq = nx; Yq = ny; Zq = nz;
+                        Normalize();
+                    }
+                }
+            }
         }
 
         static void RotateQ(double qw, double qx, double qy, double qz,
@@ -504,11 +565,10 @@ namespace SensorViewer
             // --- 見出し ---
             using (var tb = new SolidBrush(Color.FromArgb(225, 228, 232)))
                 g.DrawString(Title + "  [" + Unit + "]  " + Note, Font, tb, 10, 5);
-            using (var fb = new SolidBrush(Color.FromArgb(150, 155, 162)))
-            {
-                for (int i = 0; i < 4; i++)
-                    g.DrawString(Names[i], Font, fb, right + 6, 24 + i * 14);
-            }
+            // --- 凡例（系列色つき）。タイトル行の右端に置き、目盛ラベルと重ねない ---
+            for (int i = 0; i < 4; i++)
+                using (var cb = new SolidBrush(Colors[i]))
+                    g.DrawString(Names[i], Font, cb, right + 6 + i * 15, 5);
 
             if (Paused || Ring == null || Sync == null) { DrawSleepOverlay(g, "一時停止"); return; }
 
@@ -585,10 +645,10 @@ namespace SensorViewer
                 }
             }
 
-            // --- スケール値 ---
+            // --- スケール値（凡例の下から上→下に並べる） ---
             using (var fb = new SolidBrush(Color.FromArgb(150, 155, 162)))
             {
-                g.DrawString(Fmt(_hi), Font, fb, right + 6, 82);
+                g.DrawString(Fmt(_hi), Font, fb, right + 6, top + 2);
                 g.DrawString(Fmt((_hi + _lo) / 2), Font, fb, right + 6, (top + bottom) / 2 - 7);
                 g.DrawString(Fmt(_lo), Font, fb, right + 6, bottom - 8);
             }
@@ -627,6 +687,7 @@ namespace SensorViewer
         public string Status = "起動中…";
         public Color StatusColor = Color.FromArgb(230, 200, 120);
         public double ReportHz, TsRate, TempC, HeadingDeg, TiltX, TiltZ, AccG;
+        public double OrientYawDeg;             // 姿勢推定から出した yaw
         public int StatusFlag;
         public int Ax, Ay, Az, Gx, Gy, Gz, Mx, My, Mz;
         public bool HasData, BiasInit;
@@ -661,54 +722,11 @@ namespace SensorViewer
             Line(g, ref y, x, "ジャイロ X/Y/Z", HasData ? Gx.ToString() + " / " + Gy.ToString() + " / " + Gz.ToString() : "-");
             Line(g, ref y, x, "  バイアス", BiasInit ? BiasX.ToString("0") + " / " + BiasY.ToString("0") + " / " + BiasZ.ToString("0") : "（自動推定待ち）");
             Line(g, ref y, x, "コンパス X/Y/Z", HasData ? Mx.ToString() + " / " + My.ToString() + " / " + Mz.ToString() : "-");
-            y += 10;
+            y += 6;
 
-            // --- 方位コマ（未較正なので相対回転の確認用） ---
-            using (var tb = new SolidBrush(Color.FromArgb(150, 155, 162)))
-                g.DrawString("コンパス方位（未較正・相対）", Font, tb, x, y);
-            y += 18;
-            int cx = x + 70, cy = y + 70, r = 62;
-            using (var pen = new Pen(Color.FromArgb(70, 76, 86)))
-            {
-                g.DrawEllipse(pen, cx - r, cy - r, r * 2, r * 2);
-                g.DrawLine(pen, cx, cy - r, cx, cy + r);
-                g.DrawLine(pen, cx - r, cy, cx + r, cy);
-            }
-            if (HasData)
-            {
-                double rad = HeadingDeg * Math.PI / 180.0;
-                float nx = (float)(cx + Math.Sin(rad) * (r - 8));
-                float ny = (float)(cy - Math.Cos(rad) * (r - 8));
-                using (var pen = new Pen(Color.FromArgb(240, 200, 90), 3f))
-                    g.DrawLine(pen, cx, cy, nx, ny);
-                using (var sb = new SolidBrush(Color.FromArgb(240, 200, 90)))
-                    g.FillEllipse(sb, nx - 4, ny - 4, 8, 8);
-                using (var tb = new SolidBrush(Color.FromArgb(180, 185, 195)))
-                    g.DrawString(HeadingDeg.ToString("0") + " deg", Font, tb, x + 150, cy - 8);
-            }
-            y += r * 2 + 16;
-
-            // --- 重力方向（加速度の水平成分） ---
-            using (var tb = new SolidBrush(Color.FromArgb(150, 155, 162)))
-                g.DrawString("重力方向（加速度 XZ 面）", Font, tb, x, y);
-            y += 18;
-            int gx = x + 70, gy = y + 70, gr = 62;
-            using (var pen = new Pen(Color.FromArgb(70, 76, 86)))
-            {
-                g.DrawEllipse(pen, gx - gr, gy - gr, gr * 2, gr * 2);
-                g.DrawLine(pen, gx - gr, gy, gx + gr, gy);
-                g.DrawLine(pen, gx, gy - gr, gx, gy + gr);
-            }
-            if (HasData && AccG > 0.05)
-            {
-                double k = 1.0 / Math.Max(1.0, Math.Sqrt(TiltX * TiltX + TiltZ * TiltZ));
-                float dx = (float)(gx + TiltX * k * (gr - 6));
-                float dy = (float)(gy + TiltZ * k * (gr - 6));
-                using (var pen = new Pen(Color.FromArgb(110, 160, 255), 2f))
-                    g.DrawLine(pen, gx, gy, dx, dy);
-                using (var sb = new SolidBrush(Color.FromArgb(110, 160, 255)))
-                    g.FillEllipse(sb, dx - 5, dy - 5, 10, 10);
-            }
+            // --- 方位は左の大型キューブ（方位コマ）に移設。ここは数値だけ ---
+            Line(g, ref y, x, "マグ方位(生)", HasData ? HeadingDeg.ToString("0") + " °" : "-");
+            Line(g, ref y, x, "姿勢 yaw", HasData ? OrientYawDeg.ToString("0") + " °" : "-");
         }
 
         void Line(Graphics g, ref int y, int x, string name, string val)
@@ -733,6 +751,9 @@ namespace SensorViewer
         public string Status = "待機中";
         public double GyroFactor = 1.0;
         public double OffYaw, OffPitch, OffRoll;   // 見立てオフセット [deg]
+        public bool MagYaw;                        // コンパス yaw 補正の状態
+        public bool MagHas;                        // 磁気データが届いているか
+        public double WorldMagAzDeg, YawDeg;       // 方位コマの2本の針 [deg]
 
         static readonly float[,] Vtx = {
             { -1,-1,-1 }, { 1,-1,-1 }, { 1,1,-1 }, { -1,1,-1 },
@@ -776,8 +797,8 @@ namespace SensorViewer
             g.SmoothingMode = SmoothingMode.AntiAlias;
             int w = ClientSize.Width, h = ClientSize.Height;
             if (w < 80 || h < 80) return;
-            int cx = w / 2, cy = h / 2 + 10;
-            double R = Math.Min(w * 0.34, (h - 46) * 0.34);
+            int cx = (int)(w * 0.45), cy = (int)(h * 0.46);
+            double R = Math.Min(Math.Min(cx, Math.Min(cy, h - cy)) / 2.05, 300.0);   // 投影最大 ≒ 1.9R で見切れない値
 
             // --- 頂点を回転して投影 ---
             for (int i = 0; i < 8; i++)
@@ -829,20 +850,64 @@ namespace SensorViewer
             DrawAxis(g, cx, cy, R, 0, 1.75, 0, "Y", Color.FromArgb(110, 220, 110));
             DrawAxis(g, cx, cy, R, 0, 0, 1.75, "Z", Color.FromArgb(110, 160, 255));
 
+            // --- 方位コマ（右下） ---
+            DrawRose(g, w, h);
+
             // --- 見出し ---
             using (var tb = new SolidBrush(Color.FromArgb(225, 228, 232)))
+            {
                 g.DrawString("姿勢（センサ軸基準）", Font, tb, 10, 6);
+                g.DrawString("ジャイロ感度 ×" + GyroFactor.ToString("0.00") + "   [ / ] で調整", Font, tb, 10, 24);
+            }
+            string magLine;
+            Color magCol;
+            if (!MagHas) { magLine = "マグ未受信（方位コマなし）"; magCol = Color.FromArgb(230, 200, 120); }
+            else if (MagYaw) { magLine = "マグ yaw 補正 ON    （M=切替 / N=方位リセット）"; magCol = Color.FromArgb(130, 220, 140); }
+            else { magLine = "マグ yaw 補正 OFF    （M=ON・現在は yaw がドリフトします）"; magCol = Color.FromArgb(230, 200, 120); }
+            using (var sb = new SolidBrush(magCol)) g.DrawString(magLine, Font, sb, 10, 42);
+
             using (var fb = new SolidBrush(Color.FromArgb(150, 155, 162)))
             {
-                g.DrawString("ジャイロ感度 ×" + GyroFactor.ToString("0.00") + "  [ / ] で調整", Font, fb, 10, h - 46);
                 g.DrawString("オフセット yaw " + NormDeg(OffYaw).ToString("0") +
                              "  pitch " + OffPitch.ToString("0") + "  roll " + OffRoll.ToString("0") +
                              "  （矢印 / , .）", Font, fb, 10, h - 32);
                 using (var sb = new SolidBrush(HasData ? Color.FromArgb(130, 220, 140) : Color.FromArgb(230, 200, 120)))
                     g.DrawString(Status, Font, sb, 10, h - 18);
             }
-            using (var fb = new SolidBrush(Color.FromArgb(120, 125, 135)))
-                g.DrawString("yaw はドリフトします（地磁気は未較正）", Font, fb, w - 210, 6);
+        }
+
+        /// <summary>
+        /// 方位コマ。黄針=世界座標の磁気方位（マグ補正 ON なら固定＝北の目印）、
+        /// 水色針=コントローラの前向き（体 +X）。両者の開きが「起動後に回った角度」。
+        /// </summary>
+        void DrawRose(Graphics g, int w, int h)
+        {
+            if (!MagHas || Orient == null) return;
+            int rc = Math.Max(40, Math.Min(64, Math.Min(w, h) / 9));
+            int rx = w - rc - 20, ry = h - rc - 34;
+            if (rx - rc < w * 0.62 || ry - rc < h * 0.55) return;   // キューブに重なりすぎたら省略
+            using (var ring = new Pen(Color.FromArgb(70, 76, 86), 1.5f))
+                g.DrawEllipse(ring, rx - rc, ry - rc, rc * 2, rc * 2);
+            using (var tick = new Pen(Color.FromArgb(95, 100, 110), 1f))
+                for (int k = 0; k < 8; k++)
+                {
+                    double a = k * Math.PI / 4.0, c = Math.Cos(a), s = Math.Sin(a);
+                    g.DrawLine(tick, (float)(rx + c * rc * 0.84), (float)(ry - s * rc * 0.84),
+                                     (float)(rx + c * rc), (float)(ry - s * rc));
+                }
+            DrawNeedle(g, rx, ry, rc * 0.88, WorldMagAzDeg, Color.FromArgb(245, 205, 90), 2.2f, "N");
+            DrawNeedle(g, rx, ry, rc * 0.74, YawDeg, Color.FromArgb(110, 190, 250), 3.0f, "前");
+            using (var sb = new SolidBrush(Color.FromArgb(150, 155, 162)))
+                g.DrawString("yaw " + YawDeg.ToString("0") + "°", Font, sb, rx - 26, ry + rc + 6);
+        }
+
+        void DrawNeedle(Graphics g, int cx, int cy, double len, double deg, Color col, float width, string tip)
+        {
+            double a = deg * Math.PI / 180.0, c = Math.Cos(a), s = Math.Sin(a);
+            float x = (float)(cx + c * len), y = (float)(cy - s * len);
+            float tx = (float)(cx - c * len * 0.22), ty = (float)(cy + s * len * 0.22);
+            using (var pen = new Pen(col, width)) { pen.EndCap = LineCap.RoundAnchor; g.DrawLine(pen, tx, ty, x, y); }
+            using (var sb = new SolidBrush(col)) g.DrawString(tip, Font, sb, x - 4, y - 13);
         }
 
         static double NormDeg(double d) { while (d < 0) d += 360; while (d >= 360) d -= 360; return d; }
@@ -915,7 +980,7 @@ namespace SensorViewer
             foreach (Button b in new Button[] { _btnPause, _btnBias, _btnWindow, _btnCsv })
             { b.Left = bx; b.Top = 7; top.Controls.Add(b); bx += b.Width + 8; }
             var lbl = new Label();
-            lbl.Text = "Space=一時停止  B=基準化  W=窓切替  S=CSV  R=姿勢リセット  矢印/,, .=見立て  [ ]=感度  Esc=終了";
+            lbl.Text = "Space=一時停止  B=基準化  W=窓  S=CSV  R=姿勢リセット  矢印/,, .=見立て  [ ]=感度  M=マグ補正  N=方位リセット  Esc=終了";
             lbl.AutoSize = true; lbl.ForeColor = Color.FromArgb(140, 145, 155);
             lbl.Location = new Point(bx + 8, 13);
             top.Controls.Add(lbl);
@@ -940,18 +1005,20 @@ namespace SensorViewer
             grid.Controls.Add(_gyro, 0, 1);
             grid.Controls.Add(_mag, 0, 2);
 
-            // --- 右パネル（上に姿勢キューブ、下に数値） ---
+            // --- 右パネル（上に数値、下にグラフ 3 枚） ---
             var rightBox = new Panel();
-            rightBox.Dock = DockStyle.Right; rightBox.Width = 320;
+            rightBox.Dock = DockStyle.Right; rightBox.Width = 420;
             rightBox.BackColor = Color.FromArgb(28, 30, 35);
-            _cube = new CubeView(); _cube.Dock = DockStyle.Top; _cube.Height = 330;
+            _info = new InfoPanel(); _info.Dock = DockStyle.Top; _info.Height = 312;
+            rightBox.Controls.Add(grid);    // 先に Fill
+            rightBox.Controls.Add(_info);   // 後に Top
+
+            // --- 左：大きな姿勢キューブ（主役） ---
+            _cube = new CubeView(); _cube.Dock = DockStyle.Fill;
             _cube.Orient = _orient;
-            _info = new InfoPanel(); _info.Dock = DockStyle.Fill;
-            rightBox.Controls.Add(_info);   // 先に Fill
-            rightBox.Controls.Add(_cube);   // 後に Top
 
             // dock の順序: 先に Fill、そのあと Right / Top
-            Controls.Add(grid);
+            Controls.Add(_cube);
             Controls.Add(rightBox);
             Controls.Add(top);
 
@@ -989,6 +1056,8 @@ namespace SensorViewer
             c.Title = title; c.Unit = unit; c.Note = note;
             c.Ring = _ring; c.Sync = _sync;
             c.Margin = new Padding(2, 2, 2, 2);
+            // TableLayoutPanel はデフォルト Anchor(左上)だとサイズを伸ばさない（0x0 のまま）ので全方向固定
+            c.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Bottom | AnchorStyles.Right;
             return c;
         }
 
@@ -1119,7 +1188,12 @@ namespace SensorViewer
             _cube.HasData = has;
             _cube.GyroFactor = _orient.GyroFactor;
             _cube.Status = _info.Status;
+            _cube.MagYaw = _orient.MagYaw;
+            _cube.MagHas = has && s.HasMag && _orient.MagRefInit;
+            _cube.WorldMagAzDeg = Norm(_orient.MagWorldAz * 180.0 / Math.PI);
+            _cube.YawDeg = _orient.YawDeg;
             _cube.Invalidate();
+            _info.OrientYawDeg = _orient.YawDeg;
             _acc.Invalidate(); _gyro.Invalidate(); _mag.Invalidate(); _info.Invalidate();
         }
 
@@ -1155,6 +1229,8 @@ namespace SensorViewer
             else if (e.KeyCode == Keys.W) { CycleWindow(); e.Handled = true; }
             else if (e.KeyCode == Keys.S) { SaveCsv(); e.Handled = true; }
             else if (e.KeyCode == Keys.R) { _orient.Reset(); _cube.OffYaw = _cube.OffPitch = _cube.OffRoll = 0; }
+            else if (e.KeyCode == Keys.M) { _orient.MagYaw = !_orient.MagYaw; e.Handled = true; }
+            else if (e.KeyCode == Keys.N) { _orient.ResetMagRef(); e.Handled = true; }
             else if (e.KeyCode == Keys.OemOpenBrackets) { _orient.GyroFactor = Math.Max(0.10, _orient.GyroFactor * 0.9); }
             else if (e.KeyCode == Keys.OemCloseBrackets) { _orient.GyroFactor = Math.Min(10.0, _orient.GyroFactor * 1.1); }
             else if (e.KeyCode == Keys.Left) { _cube.OffYaw -= 15; e.Handled = true; }
@@ -1333,12 +1409,32 @@ namespace SensorViewer
             for (int i = 1; i <= 328; i++) { sD.T = i / 165.0; oD.Update(sD, Consts.GyroPerDps); }
             double aD = oD.AngleDegFromIdentity();
 
+            // E) コンパス yaw 補正: ジャイロに 1deg/s のバイアスが流れ続けると yaw は 30 秒で
+            //    30 度ドリフトするが、マグ補正 ON なら磁気方位が基準に戻るので数度に収まる
+            double aEoff = RunMagTest(false), aEon = RunMagTest(true);
+
             sb.AppendLine(string.Format("  A 静止         : 姿勢変化 {0,8:0.00} deg（期待 ≒ 0）", aA));
             sb.AppendLine(string.Format("  B 90deg/s×1秒  : 姿勢変化 {0,8:0.0} deg（期待 90）", aB));
             sb.AppendLine(string.Format("  C 重力補正     : 推定「上」と +X の内積 {0,8:0.00}（期待 ≒ 1）", px));
             sb.AppendLine(string.Format("  D 振り中(3g)   : 姿勢変化 {0,8:0.00} deg（期待 ≒ 0）", aD));
-            bool ok = (aA < 1.0) && (Math.Abs(aB - 90.0) < 3.0) && (px > 0.95) && (aD < 1.0);
+            sb.AppendLine(string.Format("  E マグ yaw補正 : OFF {0,8:0.0} deg / ON {1,8:0.0} deg（バイアス 1deg/s を 30 秒、期待 OFF ≒ 30 / ON ≒ 2）", aEoff, aEon));
+            bool ok = (aA < 1.0) && (Math.Abs(aB - 90.0) < 3.0) && (px > 0.95) && (aD < 1.0) &&
+                      (aEoff > 25.0) && (aEon < 6.0);
             sb.AppendLine(string.Format("  orient filter = {0}", ok ? "OK" : "NG"));
+        }
+
+        /// <summary>ジャイロに 1deg/s のバイアス＋体固定の磁気ベクトルを 30 秒与え、yaw のドリフト量を返す。</summary>
+        static double RunMagTest(bool magYaw)
+        {
+            var o = new Orient(); o.MagYaw = magYaw;
+            var s = new Sample();
+            s.HasGyro = true; s.HasAcc = true; s.HasMag = true;
+            s.Az = (int)Consts.AccPerG;                 // 静止（重力は +Z）
+            s.Mx = 400; s.My = -300; s.Mz = -450;        // 体に固定された磁気ベクトル
+            s.Gz = (int)Consts.GyroPerDps;               // 1 deg/s のバイアス
+            for (int i = 1; i <= 4950; i++)              // 30 秒 @165Hz
+            { s.T = i / 165.0; o.Update(s, Consts.GyroPerDps); }
+            return o.AngleDegFromIdentity();
         }
 
         static int Finish(StringBuilder sb, string outPath, int code)
