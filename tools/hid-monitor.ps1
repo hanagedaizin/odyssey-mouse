@@ -21,6 +21,7 @@ param(
     [switch]$Raw,
     [switch]$PerReport,
     [switch]$Events,
+    [switch]$Sensor,
     [string]$InstanceMatch = ''
 )
 
@@ -223,6 +224,19 @@ function Get-UsageLabel([int]$page, [int]$usage) {
     }
 }
 
+# 符号付きに展開する（HidP_GetData の RawValue はビット幅ぶんの unsigned）
+function To-Signed([uint32]$v, [int]$bits) {
+    if ($bits -ge 32) {
+        if (($v -shr 31) -ne 0) { return ([int64]$v - 4294967296) }
+        return [int64]$v
+    }
+    $mask = [uint32]((1 -shl $bits) - 1)
+    $v = $v -band $mask
+    $sign = [uint32](1 -shl ($bits - 1))
+    if (($v -band $sign) -ne 0) { return ([int64]$v - [int64](1 -shl $bits)) }
+    return [int64]$v
+}
+
 # ---- 対象デバイスを探す ----
 $candidates = @()
 foreach ($p in [HidMon]::Enumerate()) {
@@ -259,6 +273,33 @@ foreach ($path in $candidates) {
         }
     }
 
+    # ---- センサ (vendor ページ 0xFE) の DataIndex を Usage から特定する ----
+    $sensorFields = @()
+    $sensorNext = $null
+    if ($Sensor) {
+        $defs = @(
+            @{ K = 'acc';  Usage = 0x453, 0x454, 0x455; Bits = 24; Label = '加速度' },
+            @{ K = 'gyro'; Usage = 0x457, 0x458, 0x459; Bits = 24; Label = 'ジャイロ' },
+            @{ K = 'mag';  Usage = 0x485, 0x486, 0x487; Bits = 16; Label = 'コンパス' },
+            @{ K = 'temp'; Usage = 0x434;               Bits = 16; Label = '温度' },
+            @{ K = 'time'; Usage = 0x529;               Bits = 32; Label = 'ts' },
+            @{ K = 'st';   Usage = 0x18;                Bits = 2;  Label = '状態' }
+        )
+        foreach ($d in $defs) {
+            $idxs = @()
+            foreach ($u in $d.Usage) {
+                foreach ($di in $map.ValueUsage.Keys) {
+                    if ($map.ValueUsagePage[$di] -eq 0x00FE -and $map.ValueUsage[$di] -eq $u) { $idxs += $di; break }
+                }
+            }
+            $sensorFields += [pscustomobject]@{ K = $d.K; Idxs = $idxs; Bits = $d.Bits; Label = $d.Label; Latest = @{}; MagMin = $null; MagMax = $null }
+        }
+        Emit '  --- センサフィールド (vendor ページ 0xFE) ---'
+        foreach ($f in $sensorFields) {
+            Emit ("    {0,-8} idx={1,-10} {2}bit" -f $f.Label, ($f.Idxs -join ','), $f.Bits)
+        }
+    }
+
     # 入力レポート長ぶんのバッファ
     $bufLen = [Math]::Max([int]$caps.InputReportByteLength, 64) + 8
     $deadline = (Get-Date).AddSeconds($Seconds)
@@ -288,6 +329,49 @@ foreach ($path in $candidates) {
         $rid = $buf2[0]
         $counts[$rid] = 1 + [int]$counts[$rid]
         $rep = [HidMon]::Decode($pp, $map, $buf2, $len, $Raw, [int]$caps.InputReportByteLength)
+        if ($Sensor -and $sensorFields.Count -gt 0) {
+          try {
+            foreach ($f in $sensorFields) {
+                foreach ($i in $f.Idxs) { if ($rep.Raw.ContainsKey($i)) { $f.Latest[$i] = [uint32]$rep.Raw[$i] } }
+            }
+            $nowS = Get-Date
+            if ($null -eq $sensorNext -or $nowS -ge $sensorNext) {
+                $sensorNext = $nowS.AddMilliseconds(300)
+                $parts = @()
+                foreach ($f in $sensorFields) {
+                    if ($f.Idxs.Count -eq 0) { continue }
+                    $vals = @()
+                    foreach ($i in $f.Idxs) {
+                        $sval = if ($f.Latest.ContainsKey($i)) { [uint32]$f.Latest[$i] } else { [uint32]0 }
+                        $vals += (To-Signed $sval $f.Bits)
+                    }
+                    if ($f.K -eq 'temp') {
+                        $parts += ('{0}={1:0.00}C' -f $f.Label, ($vals[0] / 100.0))
+                    } elseif ($f.K -eq 'time') {
+                        $ts = if ($f.Latest.ContainsKey($f.Idxs[0])) { $f.Latest[$f.Idxs[0]] } else { [uint32]0 }
+                        $parts += ('ts={0}' -f $ts)
+                    } elseif ($f.K -eq 'st') {
+                        # 2bit の状態フラグは符号拡張しない (0..3 のまま)
+                        $stv = if ($f.Latest.ContainsKey($f.Idxs[0])) { [uint32]$f.Latest[$f.Idxs[0]] } else { [uint32]0 }
+                        $parts += ('{0}={1}' -f $f.Label, $stv)
+                    } else {
+                        $sum = 0.0
+                        foreach ($x in $vals) { $sum += [double]$x * [double]$x }
+                        $mag = [Math]::Sqrt($sum)
+                        if ($null -eq $f.MagMin -or $mag -lt $f.MagMin) { $f.MagMin = $mag }
+                        if ($null -eq $f.MagMax -or $mag -gt $f.MagMax) { $f.MagMax = $mag }
+                        $parts += ('{0}=({1}) |{2}|={3:0}' -f $f.Label, (($vals | ForEach-Object { [int]$_ }) -join ','), $f.K, $mag)
+                    }
+                }
+                Emit ("  [{0:HH:mm:ss.fff}] {1}" -f $nowS, ($parts -join '  '))
+            }
+          } catch {
+            Emit ('  SENSOR-ERR: ' + $_.Exception.Message)
+            Emit ($_.InvocationInfo.PositionMessage)
+            Emit ($_.ScriptStackTrace)
+            $Sensor = $false
+          }
+        }
         if ($PerReport) {
             Emit ("  [{0:HH:mm:ss.fff}] ReportID={1} len={2}" -f (Get-Date), $rep.ReportID, $len)
             Emit ("    raw: {0}" -f $rep.Hex)
@@ -341,6 +425,16 @@ foreach ($path in $candidates) {
             Emit ("    idx={0,-3} 押下回数={1}" -f $k, $pressCount[$k])
         }
     }
+    if ($Sensor) {
+        Emit ''
+        Emit '  --- センサ集計（このセッション） ---'
+        foreach ($f in $sensorFields) {
+            if ($f.Idxs.Count -eq 0) { Emit ("    {0,-8} : 該当 Usage なし" -f $f.Label); continue }
+            if ($null -eq $f.MagMin) { Emit ("    {0,-8} : 値を受信せず" -f $f.Label); continue }
+            Emit ("    {0,-8} |m| min={1:0}  max={2:0}" -f $f.Label, $f.MagMin, $f.MagMax)
+        }
+    }
+    if (-not $Sensor) {
     Emit ''
     Emit '  --- DataIndex 統計 ---'
     Emit ("    {0,-5} {1,-4} {2,-34} {3,12} {4,12} {5,12} {6,8} {7,8}" -f 'idx', 'kind', 'Usage', 'min', 'max', 'last', 'changes', 'seen')
@@ -360,6 +454,8 @@ foreach ($path in $candidates) {
     }
     Emit '  --- ReportID 別 受信回数 ---'
     foreach ($k in ($counts.Keys | Sort-Object)) { Emit ("    ReportID={0} : {1} 回" -f $k, $counts[$k]) }
+
+    }   # if (-not $Sensor)
 
     [void][HidMon]::HidD_FreePreparsedData($pp)
     $h.Dispose()
