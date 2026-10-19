@@ -34,7 +34,8 @@ $refs = @(
     (Join-Path $fx 'System.dll'),
     (Join-Path $fx 'System.Core.dll'),
     (Join-Path $fx 'System.Drawing.dll'),
-    (Join-Path $fx 'System.Windows.Forms.dll')
+    (Join-Path $fx 'System.Windows.Forms.dll'),
+    (Join-Path $fx 'System.Web.Extensions.dll')   # glTF(.glb) の JSON 解析に JavaScriptSerializer で使う
 )
 foreach ($r in $refs) { if (-not (Test-Path $r)) { throw "missing reference: $r" } }
 
