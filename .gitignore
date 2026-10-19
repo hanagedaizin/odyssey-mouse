@@ -1,6 +1,8 @@
 # ---- ビルド成果物（build.ps1 で再生成できます） ----
 app/obj/
 app/dist/
+tools/sensor-viewer/obj/
+tools/sensor-viewer/dist/
 
 # ---- 計測ログ（実機から取得した生データ・容量が大きいので非同期） ----
 logs/

@@ -185,6 +185,31 @@ powershell -ExecutionPolicy Bypass -File tools\hid-monitor.ps1 -Seconds 120 -Sen
 300ms 毎に `加速度=(x,y,z) |acc|=…  ジャイロ=…  コンパス=…  温度=…  ts=…  状態=…` を 1 行出し、
 終了時に 3 系の大きさの min/max 集計を出す。マウス用途では引き続き未使用（入力は idx7〜11 のみ参照）。
 
+**ビジュアライザ `tools/sensor-viewer/`**（2026-10 追加）: グラフ 3 枚＋数値＋方位コマ＋
+**姿勢キューブ**（ジャイロ積分＋加速度による重力補正の相補フィルタ）を GDI+ で描く常駐ツール。
+コントローラを傾けるとキューブが一緒に回る。読み取りは本体アプリと同じ経路なので
+`OdysseyMouse.exe` と同時に動かせる。
+
+```
+powershell -ExecutionPolicy Bypass -File tools\sensor-viewer\build.ps1     # csc のみでビルド
+tools\sensor-viewer\dist\SensorViewer.exe                                  # UI 起動
+tools\sensor-viewer\dist\SensorViewer.exe -SelfTest 10                     # 画面なしの回帰確認
+```
+
+UI キー: `Space` 一時停止 / `B` ジャイロ基準化 / `W` 表示窓 (2/5/10 秒) / `S` CSV 保存 /
+`R` 姿勢リセット / 矢印・`,` `.` 見立てオフセット / `[` `]` ジャイロ感度 / `Esc` 終了。
+
+`-SelfTest` は実機データの統計に加えて**合成データで姿勢フィルタも検証**する
+（A 静止で 0deg / B 90deg/s×1秒で 89.5deg / C 重力補正の収束 / D 振り中は補正しない → `orient filter = OK`）。
+
+既知の制約:
+
+- **yaw（水平回り）はドリフトする**。地磁気（コンパス）は未較正（ハードアイアン等）なので補正に使っていない。
+- ジャイロのスケールは **±2000deg/s 想定（1LSB = 4194 counts/(deg/s)）** の推定値。実物が違うと回転速度が比例してずれる
+  → `[` `]` キーで表示倍率を調整して合わせる。
+- キューブの軸は**センサ軸基準**（0x453/454/455 = X/Y/Z と推定）。本体の向きと合えば矢印キーの見立てオフセットで揃えられる。
+- IMU がスリープしている間は積分を止め、明けの巨大な dt は捨てる（姿勢が一瞬で飛ぶのを防ぐ）。
+
 ---
 
 ## 4. ボタン（DataIndex 0〜6 / 7個）
