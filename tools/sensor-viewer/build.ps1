@@ -59,4 +59,18 @@ foreach ($r in $refs) { [void]$cscArgs.Add('/r:' + $r) }
 if ($LASTEXITCODE -ne 0) { throw "build failed (exit $LASTEXITCODE)" }
 Write-Host ("ok: " + $outExe + "  " + ("{0:N0}" -f (Get-Item $outExe).Length) + " bytes")
 
+# ---------------------------------------------------------------------------
+# exe.config : GDI+ 等のネイティブ例外 (AccessViolation) でプロセスを落とさず
+# ログに残して続行できるようにする（ビジュアライザ用の保険）。
+Write-Step "SensorViewer.exe.config"
+$cfg = '<?xml version="1.0" encoding="utf-8"?>' + "`r`n" +
+       '<configuration>' + "`r`n" +
+       '  <runtime>' + "`r`n" +
+       '    <legacyCorruptedStateExceptionsPolicy enabled="true"/>' + "`r`n" +
+       '  </runtime>' + "`r`n" +
+       '</configuration>' + "`r`n"
+$cfgPath = $outExe + '.config'
+[System.IO.File]::WriteAllText($cfgPath, $cfg, (New-Object System.Text.UTF8Encoding($false)))
+Write-Host ("ok: " + $cfgPath)
+
 Write-Step "done"

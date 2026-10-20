@@ -236,7 +236,7 @@ namespace SensorViewer
         public bool Open()
         {
             string p = FindPath(_vid, _pid);
-            if (p == null) return false;
+            if (p == null) { LastErr = 0; return false; }
             return OpenPath(p);
         }
 
@@ -245,7 +245,13 @@ namespace SensorViewer
             Close();
             _path = path;
             _h = Nt.CreateFile(path, GENERIC_READ, SHARE_RW, IntPtr.Zero, OPEN_EXISTING, FLAG_OVERLAPPED, IntPtr.Zero);
-            if (_h.IsInvalid) { _h = null; return false; }
+            if (_h.IsInvalid)
+            {
+                LastErr = Marshal.GetLastWin32Error();   // 5 = アクセス拒否（oem127.inf の Security。fix-hid-acl.ps1 参照）
+                _h = null;
+                return false;
+            }
+            LastErr = 0;
             _ev = Nt.CreateEvent(IntPtr.Zero, true, false, IntPtr.Zero);
             if (!Nt.HidD_GetPreparsedData(_h, out _pp)) { Close(); return false; }
             var caps = new Nt.HIDP_CAPS();
@@ -360,6 +366,9 @@ namespace SensorViewer
             s.Mz = (int)Get(0x487, out h); s.HasMag |= h;
             s.Temp = (int)Get(0x434, out h);
             s.Status = (int)GetUnsigned(0x18, out h);   // 2bit フラグなので符号拡張しない
+            // 状態 0 = IMU スリープ。フィールド自体は 0 で返ってくるので、ここで「データ無し」に
+            // 落とさないと位置推定が重力を差し引き続けてモデルが箱の外へ落ちていく。
+            if (s.Status == 0) { s.HasAcc = s.HasGyro = s.HasMag = false; }
             s.Ts = Get(0x529, out h);
             return s;
         }
@@ -369,15 +378,17 @@ namespace SensorViewer
     internal static class Consts
     {
         public const double AccPerG = 490000.0;    // 1g ≒ 49 万カウント（推定、docs/spec §3-2）
-        public const double GyroPerDps = 4194.0;   // ±2000 deg/s 想定 → 4194 counts/(deg/s)
+        // ジャイロのスケール。実機データ（20秒ぶんの激しい回転）から
+        // 「回転軸の一致する区間での角度比」で求めた実測値 ≒ 1700 counts/(deg/s)
+        // （公称 4194 の約 0.41 倍。公称のままだと回転量が 1/2.47 にしかならない）
+        public const double GyroPerDps = 1700.0;
     }
 
     // ---------------------------------------------------------------- 姿勢推定
     /// <summary>
     /// ジャイロ積分＋加速度（重力）補正の相補フィルタ＋コンパスによる yaw 補正。
     /// q は「体座標 → 世界座標」のクォータニオン。世界座標は Z=上（重力補正の基準）で水平面は XY。
-    /// さらに表示合わせ用の固定回転 B（体座標系）を持ち、D = q ⊗ B が「見た目の姿勢」。
-    /// C キーのキャリブレーションは B を決める＝その瞬間の向きを identity にする。
+    /// D = q が「見た目の姿勢」。キャリブレーションでは姿勢を触らないので、実機の傾きが常にそのまま出る。
     /// </summary>
     internal sealed class Orient
     {
@@ -385,12 +396,15 @@ namespace SensorViewer
         public double GyroFactor = 1.0;      // スケール見直し用（[ / ] キー）
         public double AccGain = 2.0;         // 重力補正の強さ (1/秒, τ ≒ 0.5 秒)
 
-        // --- 表示合わせ（キャリブレーション） ---
-        public double BW = 1.0, BX, BY, BZ;  // 体座標まわりの固定回転（B = q⁻¹ で identity 化）
-        public double DW = 1.0, DX, DY, DZ;  // 表示姿勢 D = q ⊗ B（Update 毎に合成）
+        // --- 表示姿勢 ---
+        public double DW = 1.0, DX, DY, DZ;  // 表示姿勢 D = q（Update 毎に複写）
 
         // --- コンパス（地磁気）による yaw 補正 ---
-        public bool MagYaw = true;           // 既定 ON（M キーで切替）
+        // 既定 OFF（M キーで切替）。実機の磁気はハードアイアンが地磁気より大きい
+        // （オフセット |b|≒680 に対し磁界半径 ≒390 カウント）ため、本体固定成分が支配的になり
+        // yaw 補正が「いまの向きに貼り付く」力として働き、回すと逆向きに引き戻される。
+        // ハードアイアンを推定して引けるようにするまでは OFF が正しい。
+        public bool MagYaw;
         public double MagGain = 0.5;         // yaw 補正の強さ (1/秒, τ ≒ 2 秒)
         public double MagWorldAz;            // 世界座標での磁気方位 [rad]（ノックに使う）
         public bool MagRefInit { get { return _psiRefInit; } }
@@ -404,30 +418,17 @@ namespace SensorViewer
         public void Reset()
         {
             W = 1; Xq = Yq = Zq = 0;
-            BW = 1; BX = BY = BZ = 0;
             DW = 1; DX = DY = DZ = 0;
             _lastT = -1; _psiRefInit = false;
         }
         public void ResetMagRef() { _psiRefInit = false; }
 
-        /// <summary>いま向いている方角を identity にする（この向きに構えて C キー）。</summary>
-        public void SetCalibration()
-        {
-            // D = q ⊗ B = identity となる B = q⁻¹ = 共役（単位クォータニオン）
-            BW = W; BX = -Xq; BY = -Yq; BZ = -Zq;
-            ComposeDisp();
-        }
-
         void ComposeDisp()
         {
-            // D = q ⊗ B（まず B で体座標を見立て直してから世界へ写す）
-            DW = W * BW - Xq * BX - Yq * BY - Zq * BZ;
-            DX = W * BX + Xq * BW + Yq * BZ - Zq * BY;
-            DY = W * BY - Xq * BZ + Yq * BW + Zq * BX;
-            DZ = W * BZ + Xq * BY - Yq * BX + Zq * BW;
+            DW = W; DX = Xq; DY = Yq; DZ = Zq;   // D = q
         }
 
-        /// <summary>体座標 → 世界（キャリブレーション後の「見た目の向き」はこちら）。</summary>
+        /// <summary>体座標 → 世界（＝見た目の向き）。</summary>
         public void RotateDisp(out double ox, out double oy, out double oz, double vx, double vy, double vz)
         { RotateQ(DW, DX, DY, DZ, vx, vy, vz, out ox, out oy, out oz); }
 
@@ -444,6 +445,28 @@ namespace SensorViewer
             }
         }
 
+        /// <summary>体の前向き（+X 軸）の仰角 [deg]。+ が上向き（先端が上）。</summary>
+        public double PitchDeg
+        {
+            get
+            {
+                double fx, fy, fz;
+                RotateDisp(out fx, out fy, out fz, 1, 0, 0);
+                return Math.Asin(Math.Max(-1.0, Math.Min(1.0, fz))) * 180.0 / Math.PI;
+            }
+        }
+
+        /// <summary>パッド上向き（体 +Z 軸）の左右の傾き [deg]。+ が +X 側へ傾いた状態。</summary>
+        public double RollDeg
+        {
+            get
+            {
+                double ux, uy, uz;
+                RotateDisp(out ux, out uy, out uz, 0, 0, 1);
+                return Math.Atan2(ux, uz) * 180.0 / Math.PI;
+            }
+        }
+
         static double WrapPi(double a)
         {
             while (a > Math.PI) a -= 2 * Math.PI;
@@ -455,13 +478,14 @@ namespace SensorViewer
         {
             double n = Math.Sqrt(W * W + Xq * Xq + Yq * Yq + Zq * Zq);
             if (n > 1e-9) { W /= n; Xq /= n; Yq /= n; Zq /= n; }
+            else { W = 1; Xq = Yq = Zq = 0; }     // 退化したら identity（NaN 伝播を防ぐ）
         }
 
         /// <summary>1 サンプルぶん回す。countsPerDps は「1 deg/s が何 counts か」。</summary>
         public void Update(Sample s, double countsPerDps)
         {
             UpdateCore(s, countsPerDps);
-            ComposeDisp();     // 表示姿勢 D = q ⊗ B を毎サンプル更新
+            ComposeDisp();     // 表示姿勢 D = q を毎サンプル更新
         }
 
         void UpdateCore(Sample s, double countsPerDps)
@@ -569,7 +593,7 @@ namespace SensorViewer
     /// </summary>
     internal sealed class GlbModel
     {
-        public const double ModelLenM = 0.18;      // モデル長辺の実寸見立て [m]
+        public const double ModelLenM = 0.30;      // モデル長辺の実寸見立て [m]（見やすさ優先で実寸より大きめ）
 
         public int TriCount;
         public float[] P;                          // 頂点座標 [m]（9 float / 三角形）
@@ -577,10 +601,13 @@ namespace SensorViewer
         public string Source;                      // 読み込み元パス
         public double ExtentX, ExtentY, ExtentZ;   // 正規化後の外接寸法 [m]
 
-        // モデルの「正置き」見立て（Y-up の glTF を Z-up の世界に合わせる向き）。
-        // 公式モデルは「パッドが上・コントローラが +Z 向き」で作者されているので、
-        // Rx(-90) で Z 向きを水平に倒し、Ry(180) でパッドを上に戻す（= ポイントは世界 +Y＝画面の奥向き）。
-        public static double RotXDeg = -90, RotYDeg = 180, RotZDeg = 0;
+        // モデルの「正置き」見立て（Z-up の世界に、パッド上・リング先端 +X で寝かせる）。
+        // 公式モデルはノード変換後で「パッド面の法線 = +Y、リング（先端）= -Z」を向いている。
+        // そこで A·(+Y)=+Z（パッド上）、A·(-Z)=+X（リング先端）となる回転 A を
+        // Rz(-116°)·Rx(+116°) として焼き込む（下の値は A を X→Y→Z の順のオイラー角に直したもの）。
+        // 以前の Rx(-90)/Ry(180) はモデルが横向き・パッド下・リング手前になっており、
+        // 「ヨーは合うがピッチが逆／ロールだけ合う」ように見える主因だった。
+        public static double RotXDeg = 116, RotYDeg = 0, RotZDeg = -116;
 
         GlbModel() { }
 
@@ -989,6 +1016,10 @@ namespace SensorViewer
                 o.Rotate(out wx, out wy, out wz, s.Ax / _gRef, s.Ay / _gRef, s.Az / _gRef);
                 double ax = wx * G0, ay = wy * G0, az = wz * G0 - G0;   // 重力（世界 -Z）を差し引く
                 Vx += ax * dt; Vy += ay * dt; Vz += az * dt;
+                // 速度に漏れを入れる（ドリフト抑制）。重力差し引きに残る微小バイアスで
+                // 速度が一方向に伸び続け、位置が箱の端に張り付くのを防ぐ（τ ≒ 1.2 秒）。
+                double kv = 1.0 - Math.Min(dt / 1.2, 0.5);
+                Vx *= kv; Vy *= kv; Vz *= kv;
                 Px += Vx * dt; Py += Vy * dt; Pz += Vz * dt;
 
                 double rr = Px * Px + Py * Py + Pz * Pz;
@@ -1024,6 +1055,291 @@ namespace SensorViewer
                 }
                 return n;
             }
+        }
+    }
+
+    // ---------------------------------------------------------------- IMU 軸・スケールの自動整合
+    /// <summary>
+    /// 加速度（＝体座標の基準）に対して、ジャイロとコンパスの「軸の並べ替え・符号」と
+    /// ジャイロのスケールを実測データから推定する。
+    ///
+    /// 原理: 剛体なら、体座標から見た上方向の時間変化は da/dt = -ω × a を満たす
+    ///       （磁気も同じく dm/dt = -ω × m）。加速度を基準に固定し、ジャイロ/磁気の
+    ///       48 通り（並べ替え 6 × 符号 8）について区間差分との残差を比べ、最小のものを選ぶ。
+    ///       スケールは最小二乗で同時に求まり、加速度スケールに依存しない。
+    ///       判定は端末を実際に動かした区間だけで行う。
+    /// </summary>
+    internal sealed class ImuCalib
+    {
+        const int MaxRows = 1400;            // 保持サンプル数（約 7 秒ぶん）
+        const int Stride = 40;               // 比較するサンプル間隔（約 200ms。長いほど信号が大きい）
+        const int NeedPairs = 200;           // 判定に必要な「動き区間」の数
+        const double MotionThresh = 40000;   // 「動き」と見なすジャイロ大きさ [counts]
+        const double PairThresh = 50000;     // 判定に使う区間の角速度の下限 [counts]
+        const double QuietThresh = 8000;     // 生バイアス推定に使う「静止」のしきい値 [counts]
+
+        static readonly int[] Perm = { 0, 1, 2, 0, 2, 1, 1, 0, 2, 1, 2, 0, 2, 0, 1, 2, 1, 0 };
+        static readonly string[] AxisName = { "X", "Y", "Z" };
+
+        readonly object _sync = new object();
+        readonly List<double[]> _rows = new List<double[]>();
+
+        public bool Done;                    // 判定済みか
+        public int MotionRows;               // 動きのあったサンプル数（進捗表示用）
+        public string Report = "";      // A キーで診断を始めたときだけ表示する
+
+        public int[] GyroPerm = { 0, 1, 2 }; // 物理軸 i ← 生[GyroPerm[i]] × GyroSgn[i]
+        public int[] GyroSgn = { 1, 1, 1 };
+        public int[] MagPerm = { 0, 1, 2 };
+        public int[] MagSgn = { 1, 1, 1 };
+        public double GyroPerDps;            // 推定スケール [counts/(deg/s)]（0 = 未確定）
+        public double GyroResid, MagResid;   // 正規化残差（0..1、小さいほど良い）
+        public bool MagTrust = true;         // コンパスの整合が取れたか
+        public double RawBiasX, RawBiasY, RawBiasZ;   // 判定に使った生バイアス [counts]
+        public string Detail = "";
+        public double GyroBaseResid, MagBaseResid;    // 並べ替えなし（素通し）の残差
+
+        public void Restart()
+        {
+            lock (_sync)
+            {
+                _rows.Clear();
+                MotionRows = 0;
+                Done = false;
+                Enabled = true;
+                Report = "IMU整合: 収集中 — コントローラをゆっくり大きく回してください";
+            }
+        }
+
+        /// <summary>診断（A キー）を押したときだけ生データを集める。既定では何もしない。</summary>
+        public bool Enabled;
+
+        /// <summary>生サンプルを 1 つ追加（読み取りスレッドから）。未判定のときだけ保持する。</summary>
+        public void Push(double t, double ax, double ay, double az,
+                         double gx, double gy, double gz, double mx, double my, double mz)
+        {
+            lock (_sync)
+            {
+                if (!Enabled || Done) return;
+                _rows.Add(new double[] { t, ax, ay, az, gx, gy, gz, mx, my, mz });
+                if (_rows.Count > MaxRows) _rows.RemoveAt(0);
+                if (Math.Max(Math.Abs(gx), Math.Max(Math.Abs(gy), Math.Abs(gz))) > MotionThresh) MotionRows++;
+                if (MotionRows >= NeedPairs * 2 && _rows.Count >= 300) Solve();            }
+        }
+
+        void Solve()
+        {
+            // 生バイアス: 静止に近いサンプルの平均
+            double bx = 0, by = 0, bz = 0;
+            int nq = 0;
+            foreach (double[] r in _rows)
+            {
+                if (Math.Max(Math.Abs(r[4]), Math.Max(Math.Abs(r[5]), Math.Abs(r[6]))) < QuietThresh)
+                { bx += r[4]; by += r[5]; bz += r[6]; nq++; }
+            }
+            if (nq >= 20) { bx /= nq; by /= nq; bz /= nq; } else { bx = by = bz = 0; }
+
+            // 回転が十分あり、|a| が 1g 付近（＝平行移動の混入が少ない）区間だけを抜き出す。
+            // 短い差分だと加速度のノイズに埋もれるため、125ms 程度の区間で
+            //「ジャイロを積分した回転で a_i を回すと a_j になる」ことを直接確かめる。
+            var P = new List<double[]>();
+            for (int j = Stride; j < _rows.Count; j++)
+            {
+                int i = j - Stride;
+                double[] p = _rows[i], q = _rows[j];
+                double dt = q[0] - p[0];
+                if (dt < 0.12 || dt > 0.35) continue;
+                double na = Mag3(p[1], p[2], p[3]), nb = Mag3(q[1], q[2], q[3]);
+                if (na < 0.93 * Consts.AccPerG || na > 1.07 * Consts.AccPerG) continue;
+                if (nb < 0.93 * Consts.AccPerG || nb > 1.07 * Consts.AccPerG) continue;
+                // 区間の角速度積分 Θ = ∫(ω - bias) dt（台形則）
+                double t0 = 0, t1 = 0, t2 = 0;
+                double wmax = 0;
+                for (int k = i; k < j; k++)
+                {
+                    double dk = _rows[k + 1][0] - _rows[k][0];
+                    if (dk <= 0 || dk > 0.05) { dk = 0; }
+                    double w0 = (_rows[k][4] - bx + _rows[k + 1][4] - bx) * 0.5;
+                    double w1 = (_rows[k][5] - by + _rows[k + 1][5] - by) * 0.5;
+                    double w2 = (_rows[k][6] - bz + _rows[k + 1][6] - bz) * 0.5;
+                    t0 += w0 * dk; t1 += w1 * dk; t2 += w2 * dk;
+                    double m = Math.Max(Math.Abs(w0), Math.Max(Math.Abs(w1), Math.Abs(w2)));
+                    if (m > wmax) wmax = m;
+                }
+                if (wmax < PairThresh) continue;
+                P.Add(new double[] {
+                    dt,
+                    p[1], p[2], p[3],                    // a_i
+                    q[1], q[2], q[3],                    // a_j
+                    t0, t1, t2,                          // Θ（生座標・bias 除去済み）
+                    p[7], p[8], p[9],                    // m_i
+                    q[7], q[8], q[9] });                 // m_j
+            }
+            if (P.Count < NeedPairs)
+            {
+                Report = string.Format("IMU整合: 収集中（動き区間 {0}/{1}）— ゆっくり大きく回してください", P.Count, NeedPairs);
+                return;
+            }
+
+            // --- ジャイロ: a_j ≒ exp(-Θ(c))·a_i が成り立つ並べ替え・符号・スケールを探す ---
+            int[] gp = { 0, 1, 2 }, gs = { 1, 1, 1 };
+            double gc = 0, gres = 0, gbase = 0;
+            FitGyro(P, ref gp, ref gs, ref gc, ref gres, ref gbase);
+
+            // 判定に足る精度が出ているか（悪いまま確定させない）
+            if (!(gres < 0.30 || gres < 0.6 * gbase))
+            {
+                Report = string.Format("IMU整合: 判定精度が足りません（残差 {0:0}%）— もっと大きく速く動かしてください",
+                    Math.Min(gres, 1.0) * 100);
+                return;
+            }
+
+            // --- 磁気: m_j ≒ exp(-Θ)·m_i（ジャイロの判定結果で物理軸へ） ---
+            int[] mp = { 0, 1, 2 }, ms = { 1, 1, 1 };
+            double mres = 0, mbase = 0;
+            FitMag(P, gp, gs, gc, ref mp, ref ms, ref mres, ref mbase);
+
+            GyroPerm = gp; GyroSgn = gs; MagPerm = mp; MagSgn = ms;
+            GyroPerDps = (gc > 1e-9) ? ((Math.PI / 180.0) / gc) : 0.0;
+            GyroResid = gres; MagResid = mres;
+            GyroBaseResid = gbase; MagBaseResid = mbase;
+            MagTrust = mres < 0.45;
+            RawBiasX = bx; RawBiasY = by; RawBiasZ = bz;
+            Done = true;
+            Report = string.Format("IMU整合: Gyro {0} (残差{1:0}%) / Mag {2} (残差{3:0}%) / {4:0} counts/(deg/s)",
+                MapText(gp, gs), gres * 100, MapText(mp, ms), mres * 100, GyroPerDps);
+            Detail = string.Format("pairs={0} bias=({1:0},{2:0},{3:0}) nomapResid gyro={4:0.0}% mag={5:0.0}% det gyro={6} mag={7}",
+                P.Count, bx, by, bz, gbase * 100, mbase * 100, MapDet(gp, gs), MapDet(mp, ms));
+            try
+            {
+                File.WriteAllText(Path.Combine(Path.GetTempPath(), "sensor-viewer-imu.txt"),
+                    Report + "\r\n" + Detail + "\r\n", new UTF8Encoding(false));
+            }
+            catch { }
+        }
+
+        static void FitGyro(List<double[]> P, ref int[] bp, ref int[] bs, ref double bc,
+                            ref double bres, ref double bbase)
+        {
+            const double cNom = (Math.PI / 180.0) / Consts.GyroPerDps;   // 公称: [rad/s]/count
+            double best = double.MaxValue;
+            for (int cand = 0; cand < 48; cand++)
+            {
+                int[] p = { Perm[(cand >> 3) * 3], Perm[(cand >> 3) * 3 + 1], Perm[(cand >> 3) * 3 + 2] };
+                int[] s = { ((cand & 1) == 0) ? 1 : -1, ((cand & 2) == 0) ? 1 : -1, ((cand & 4) == 0) ? 1 : -1 };
+                // スケールは 1 次元なので粗く走査→絞り込み（公称比 0.2〜4.0 倍）
+                double curF = 1.0, cur = double.MaxValue;
+                for (int it = 0; it < 2; it++)
+                {
+                    double lo = (it == 0) ? 0.20 : Math.Max(0.05, curF * 0.75);
+                    double hi = (it == 0) ? 4.00 : curF * 1.34;
+                    for (int n = 0; n <= 24; n++)
+                    {
+                        double f = lo * Math.Pow(hi / lo, n / 24.0);
+                        double res = ResidGyro(P, p, s, cNom * f);
+                        if (res < cur) { cur = res; curF = f; }
+                    }
+                }
+                if (cand == 0) bbase = cur;
+                if (cur < best) { best = cur; bp = p; bs = s; bc = cNom * curF; }
+            }
+            bres = best;
+        }
+
+        static void FitMag(List<double[]> P, int[] gp, int[] gs, double gc,
+                           ref int[] bp, ref int[] bs, ref double bres, ref double bbase)
+        {
+            double best = double.MaxValue;
+            for (int cand = 0; cand < 48; cand++)
+            {
+                int[] p = { Perm[(cand >> 3) * 3], Perm[(cand >> 3) * 3 + 1], Perm[(cand >> 3) * 3 + 2] };
+                int[] s = { ((cand & 1) == 0) ? 1 : -1, ((cand & 2) == 0) ? 1 : -1, ((cand & 4) == 0) ? 1 : -1 };
+                double res = ResidMag(P, gp, gs, gc, p, s);
+                if (cand == 0) bbase = res;
+                if (res < best) { best = res; bp = p; bs = s; }
+            }
+            bres = best;
+        }
+
+        /// <summary>ベクトル (ax,ay,az) を回転ベクトル (rx,ry,rz)（角度 = |r|）で回す（Rodrigues）。</summary>
+        static void RotVec(double ax, double ay, double az, double rx, double ry, double rz,
+                           out double ox, out double oy, out double oz)
+        {
+            double th = Math.Sqrt(rx * rx + ry * ry + rz * rz);
+            if (th < 1e-12) { ox = ax; oy = ay; oz = az; return; }
+            double kx = rx / th, ky = ry / th, kz = rz / th;
+            double cb = Math.Cos(th), sb = Math.Sin(th);
+            double dot = kx * ax + ky * ay + kz * az;
+            double cx = ky * az - kz * ay, cy = kz * ax - kx * az, cz = kx * ay - ky * ax;
+            ox = ax * cb + cx * sb + kx * dot * (1 - cb);
+            oy = ay * cb + cy * sb + ky * dot * (1 - cb);
+            oz = az * cb + cz * sb + kz * dot * (1 - cb);
+        }
+
+        static double Mag3(double x, double y, double z) { return Math.Sqrt(x * x + y * y + z * z); }
+
+        /// <summary>
+        /// a_j ≒ exp(-c·Θ)·a_i（Θ は区間の角速度積分）が成り立つかを測る。
+        /// 戻り値は「a_i の変化量」に対する説明できない割合（0 = 完全一致、1 = 素通しと同じ）。
+        /// </summary>
+        static double ResidGyro(List<double[]> P, int[] p, int[] s, double c)
+        {
+            double e = 0, tot = 0;
+            for (int k = 0; k < P.Count; k++)
+            {
+                double[] r = P[k];
+                double rx = s[0] * r[7 + p[0]], ry = s[1] * r[8 + p[1]], rz = s[2] * r[9 + p[2]];
+                double ox, oy, oz;
+                RotVec(r[1], r[2], r[3], -c * rx, -c * ry, -c * rz, out ox, out oy, out oz);
+                double ex = ox - r[4], ey = oy - r[5], ez = oz - r[6];
+                e += ex * ex + ey * ey + ez * ez;
+                double dx = r[4] - r[1], dy = r[5] - r[2], dz = r[6] - r[3];
+                tot += dx * dx + dy * dy + dz * dz;
+            }
+            return tot > 0 ? e / tot : 1.0;
+        }
+
+        /// <summary>m_j ≒ exp(-c·Θ)·m_i（磁気は大きさに依らないのでスケール不要）。</summary>
+        static double ResidMag(List<double[]> P, int[] gp, int[] gs, double gc, int[] p, int[] s)
+        {
+            double e = 0, tot = 0;
+            for (int k = 0; k < P.Count; k++)
+            {
+                double[] r = P[k];
+                if (r[10] == 0 && r[11] == 0 && r[12] == 0) continue;    // 磁気なしのレポートは除外
+                double rx = gs[0] * r[7 + gp[0]], ry = gs[1] * r[8 + gp[1]], rz = gs[2] * r[9 + gp[2]];
+                double m0 = s[0] * r[10 + p[0]], m1 = s[1] * r[11 + p[1]], m2 = s[2] * r[12 + p[2]];
+                double ox, oy, oz;
+                RotVec(m0, m1, m2, -gc * rx, -gc * ry, -gc * rz, out ox, out oy, out oz);
+                double ex = ox - r[13], ey = oy - r[14], ez = oz - r[15];
+                e += ex * ex + ey * ey + ez * ez;
+                double dx = r[13] - m0, dy = r[14] - m1, dz = r[15] - m2;
+                tot += dx * dx + dy * dy + dz * dz;
+            }
+            return tot > 0 ? e / tot : 1.0;
+        }
+
+        public static string MapText(int[] p, int[] s)
+        {
+            return string.Format("({0}{1},{2}{3},{4}{5})",
+                s[0] < 0 ? "-" : "+", AxisName[p[0]],
+                s[1] < 0 ? "-" : "+", AxisName[p[1]],
+                s[2] < 0 ? "-" : "+", AxisName[p[2]]);
+        }
+
+        /// <summary>符号つき置換の行列式（+1 = 右手系のまま、-1 = 鏡像）。</summary>
+        public static int MapDet(int[] p, int[] s)
+        {
+            int inv = 0;
+            for (int i = 0; i < 3; i++)
+                for (int j = i + 1; j < 3; j++)
+                    if (p[i] > p[j]) inv++;
+            return ((inv % 2 == 0) ? 1 : -1) * s[0] * s[1] * s[2];
+        }
+
+        public static double Pick(double a, double b, double c, int i)
+        {
+            return i == 0 ? a : (i == 1 ? b : c);
         }
     }
 
@@ -1198,6 +1514,7 @@ namespace SensorViewer
         public Color StatusColor = Color.FromArgb(230, 200, 120);
         public double ReportHz, TsRate, TempC, HeadingDeg, TiltX, TiltZ, AccG;
         public double OrientYawDeg;             // 姿勢推定から出した yaw
+        public double OrientPitchDeg, OrientRollDeg;   // 同 pitch / roll
         public double PosX, PosY, PosZ, Speed;  // 位置 [m] / 速度 [m/s]（2 重積分の観察値）
         public bool Zupt;                       // 静止検出中
         public int StatusFlag;
@@ -1205,6 +1522,8 @@ namespace SensorViewer
         public bool HasData, BiasInit;
         public double BiasX, BiasY, BiasZ;
         public long SampleCount;
+        public string ImuNote = "";             // IMU 自動整合の状態（右パネルに出す）
+        public bool ImuDone;
 
         public InfoPanel()
         {
@@ -1239,12 +1558,21 @@ namespace SensorViewer
             // --- 方位は左の大型ビュー（方位コマ）に移設。ここは数値だけ ---
             Line(g, ref y, x, "マグ方位(生)", HasData ? HeadingDeg.ToString("0") + " °" : "-");
             Line(g, ref y, x, "姿勢 yaw", HasData ? OrientYawDeg.ToString("0") + " °" : "-");
+            Line(g, ref y, x, "姿勢 pitch/roll", HasData ? OrientPitchDeg.ToString("0") + " / " + OrientRollDeg.ToString("0") + " °" : "-");
             Line(g, ref y, x, "位置 X/Y/Z", HasData
                 ? (PosX * 100).ToString("0.0") + " / " + (PosY * 100).ToString("0.0") + " / " + (PosZ * 100).ToString("0.0") + " cm"
                 : "-");
             Line(g, ref y, x, "速度", HasData
                 ? (Speed * 100).ToString("0") + " cm/s" + (Zupt ? "（静止検出）" : "")
                 : "-");
+            if (!string.IsNullOrEmpty(ImuNote))
+            {
+                y += 6;
+                using (var lb = new SolidBrush(Color.FromArgb(150, 155, 162))) g.DrawString("IMU 整合", Font, lb, x, y);
+                y += 19;
+                using (var ib = new SolidBrush(ImuDone ? Color.FromArgb(150, 215, 160) : Color.FromArgb(235, 205, 120)))
+                    g.DrawString(ImuNote, Font, ib, new RectangleF(x, y, w - 2 * x, 76));
+            }
         }
 
         void Line(Graphics g, ref int y, int x, string name, string val)
@@ -1271,6 +1599,8 @@ namespace SensorViewer
         public bool HasData;
         public string Status = "待機中";
         public string ModelNote;                  // モデル読み込みの失敗理由など（HUD に出す）
+        public string ImuNote;                    // IMU 自動整合の状態（HUD に出す）
+        public bool ImuDone;                      // IMU 自動整合の判定が終わったか
         public double GyroFactor = 1.0;
         public double OffYaw, OffPitch, OffRoll;  // 見立てオフセット [deg]
         public bool MagYaw;                       // コンパス yaw 補正の状態
@@ -1281,6 +1611,7 @@ namespace SensorViewer
         public bool Zupt;                         // 静止検出中（積分停止）
         public bool Calibrated;                   // C キーでキャリブ済み
         public bool FlipX, FlipY, FlipZ;          // 軸反転の状態
+        public bool NegAcc;                       // 加速度のみ符号反転の状態
         public double LastPaintMs;                // 前回の描画時間（HUD 用）
         public string PaintErr;                   // 描画例外（あれば HUD に出す）
         public double DiagMaxXY;                  // 描画座標の最大絶対値（Overflow 調査用）
@@ -1288,6 +1619,9 @@ namespace SensorViewer
         const double Zc = 4.2;          // カメラ距離
         const double K = 2.0;           // 1 m = 2（箱の半径 0.5m → 1.0 で旧キューブと同じ収まり）
         const double BoxHalf = 0.5;     // 観察箱の半サイズ [m]
+
+        // 初期の見立て。ヨー 90° で世界 +X（＝モデルのリング先端）を画面の奥へ向ける。
+        public const double DefYaw = 90, DefPitch = -45, DefRoll = 0;
 
         // フォールバック用の立方体（±1 → ±0.5m として描く）
         static readonly float[,] Vtx = {
@@ -1331,7 +1665,7 @@ namespace SensorViewer
                      ControlStyles.UserPaint | ControlStyles.ResizeRedraw, true);
             BackColor = Color.FromArgb(24, 26, 30);
             Font = new Font("Segoe UI", 8.5f);
-            OffPitch = -60;                         // 初期視点は真上ではなく手前斜め上
+            OffYaw = DefYaw; OffPitch = DefPitch; OffRoll = DefRoll;   // リング先端が画面の奥を向く
             _triBr = new SolidBrush(Color.White);
             _edgePen = new Pen(Color.FromArgb(110, 116, 128), 1f);
             _lastCol = Color.FromArgb(0, 0, 0, 0);  // 初回は必ず色を設定させる
@@ -1350,15 +1684,17 @@ namespace SensorViewer
 
         void BuildRot()
         {
-            // 従来の OffsetRotate と同じ順序: Z(ロール) → X(ピッチ) → Y(ヨー)
+            // Z-up の世界なので、ヨーは世界 Z 軸まわり（ターテーブル）、
+            // ピッチは画面の横軸まわり、ロールは最後に画面ごと回す。
+            // 以前はヨーを Y 軸まわりにしていたため、ヨーを振ると水平線が傾いていた。
             double rr = OffRoll * Math.PI / 180.0, rp = OffPitch * Math.PI / 180.0, ry = OffYaw * Math.PI / 180.0;
             double cr = Math.Cos(rr), sr = Math.Sin(rr);
             double cp = Math.Cos(rp), sp = Math.Sin(rp);
             double cy = Math.Cos(ry), sy = Math.Sin(ry);
-            double[] mz = { cr, -sr, 0,  sr, cr, 0,  0, 0, 1 };
-            double[] mx = { 1, 0, 0,  0, cp, -sp,  0, sp, cp };
-            double[] my = { cy, 0, sy,  0, 1, 0,  -sy, 0, cy };
-            double[] m = Mul3(my, Mul3(mx, mz));
+            double[] mzYaw = { cy, -sy, 0,  sy, cy, 0,  0, 0, 1 };
+            double[] mxPitch = { 1, 0, 0,  0, cp, -sp,  0, sp, cp };
+            double[] mzRoll = { cr, -sr, 0,  sr, cr, 0,  0, 0, 1 };
+            double[] m = Mul3(mzRoll, Mul3(mxPitch, mzYaw));
             for (int i = 0; i < 9; i++) _rr[i] = m[i];
         }
 
@@ -1395,6 +1731,14 @@ namespace SensorViewer
             sy = (float)(cy - y * k * R);
         }
 
+        /// <summary>GDI+ に渡して安全な座標か（NaN/Inf、および桁が大きすぎる値を弾く）。
+        /// FillPolygon は有限でも巨大な座標で System.OverflowException を投げるため。</summary>
+        static bool OkPt(float x, float y)
+        {
+            return !float.IsNaN(x) && !float.IsInfinity(x) && !float.IsNaN(y) && !float.IsInfinity(y) &&
+                   Math.Abs(x) < 1e5f && Math.Abs(y) < 1e5f;
+        }
+
         void EnsureArrays(int n)
         {
             _mvx = new double[3 * n]; _mvy = new double[3 * n]; _mvz = new double[3 * n];
@@ -1404,6 +1748,10 @@ namespace SensorViewer
             for (int i = 0; i < n; i++) _mord[i] = i;
         }
 
+        // ネイティブ (GDI+ / hid) の AccessViolation でプロセスごと落ちないように、
+        // 破損状態例外も捕まえてログに残す（exe.config の legacyCorruptedStateExceptionsPolicy と併用）。
+        [System.Runtime.ExceptionServices.HandleProcessCorruptedStateExceptions]
+        [System.Security.SecurityCritical]
         protected override void OnPaint(PaintEventArgs e)
         {
             try { PaintAll(e.Graphics); }
@@ -1419,6 +1767,7 @@ namespace SensorViewer
         {
             long t0 = Stopwatch.GetTimestamp();
             g.Clear(BackColor);
+            PaintErr = null;
             g.SmoothingMode = SmoothingMode.AntiAlias;
             int w = ClientSize.Width, h = ClientSize.Height;
             if (w < 80 || h < 80) return;
@@ -1500,7 +1849,7 @@ namespace SensorViewer
                     path.AddLine(px, py, x, y);
                     px = x; py = y;
                 }
-                using (var pen = new Pen(Color.FromArgb(70, 220, 205), 2f))
+                using (var pen = new Pen(Color.FromArgb(52, 190, 180), 1.6f))
                     g.DrawPath(pen, path);
             }
         }
@@ -1548,13 +1897,12 @@ namespace SensorViewer
 
             var sm = g.SmoothingMode;
             g.SmoothingMode = SmoothingMode.None;          // 塗りは非 AA（速度と継ぎ目の両対策）
+            int bad = 0;                                   // GDI+ が倒した三角形（フレームは続行）
             for (int i = 0; i < n; i++)
             {
                 int t = _mord[i], i3 = t * 3, cb = t * 3;
-                // 有限でない頂点は GDI+ が Overflow で倒すため捨てる（NaN 混入時の保険）
-                if (float.IsNaN(_msx[i3]) || float.IsInfinity(_msx[i3]) || float.IsNaN(_msy[i3]) || float.IsInfinity(_msy[i3]) ||
-                    float.IsNaN(_msx[i3 + 1]) || float.IsInfinity(_msx[i3 + 1]) || float.IsNaN(_msy[i3 + 1]) || float.IsInfinity(_msy[i3 + 1]) ||
-                    float.IsNaN(_msx[i3 + 2]) || float.IsInfinity(_msx[i3 + 2]) || float.IsNaN(_msy[i3 + 2]) || float.IsInfinity(_msy[i3 + 2]))
+                // 有限でない・桁が大きすぎる頂点は GDI+ が Overflow で倒すため捨てる
+                if (!OkPt(_msx[i3], _msy[i3]) || !OkPt(_msx[i3 + 1], _msy[i3 + 1]) || !OkPt(_msx[i3 + 2], _msy[i3 + 2]))
                     continue;
                 // カメラ空間の面法線（+Z が手前 → 正の面だけ描く）
                 double e1x = _mvx[i3 + 1] - _mvx[i3], e1y = _mvy[i3 + 1] - _mvy[i3], e1z = _mvz[i3 + 1] - _mvz[i3];
@@ -1563,26 +1911,28 @@ namespace SensorViewer
                 double ny = e1z * e2x - e1x * e2z;
                 double nz = e1x * e2y - e1y * e2x;
                 double nn = Math.Sqrt(nx * nx + ny * ny + nz * nz);
-                double lam = 0.40;
+                double lam = 0.55;
                 if (nn > 1e-12)
                 {
                     // 光は左上奥から（単位化済み (0.40,0.56,0.73)）。環境光 0.40 + 拡散 0.60
                     double d = (nx * 0.40 + ny * 0.56 + nz * 0.73) / nn;
-                    if (d > 0) lam += 0.60 * d;
+                    if (d > 0) lam += 0.55 * d;
                 }
-                // 本体は黒いので暗部が背景(24,26,30)に埋もれないよう下限を盛る: 50 + 0.85×
-                int qr = 50 + (int)(C[cb] * lam * 0.85); if (qr > 255) qr = 255;
-                int qg = 50 + (int)(C[cb + 1] * lam * 0.85); if (qg > 255) qg = 255;
-                int qb = 50 + (int)(C[cb + 2] * lam * 0.85); if (qb > 255) qb = 255;
+                // 本体は黒いので暗部が背景(24,26,30)に埋もれないよう下限を盛る（見やすさ優先）
+                int qr = 95 + (int)(C[cb] * lam * 1.05); if (qr > 255) qr = 255;
+                int qg = 95 + (int)(C[cb + 1] * lam * 1.05); if (qg > 255) qg = 255;
+                int qb = 95 + (int)(C[cb + 2] * lam * 1.05); if (qb > 255) qb = 255;
                 // 5bit 量子化でブラシの色変更回数を減らす（ペインタ法の並び順は近い面が連なる）
                 var col = Color.FromArgb(255, qr & 0xF8, qg & 0xF8, qb & 0xF8);
                 if (col != _lastCol) { _triBr.Color = col; _lastCol = col; }
                 _triPt[0].X = _msx[i3]; _triPt[0].Y = _msy[i3];
                 _triPt[1].X = _msx[i3 + 1]; _triPt[1].Y = _msy[i3 + 1];
                 _triPt[2].X = _msx[i3 + 2]; _triPt[2].Y = _msy[i3 + 2];
-                g.FillPolygon(_triBr, _triPt);
-                g.DrawPolygon(_edgePen, _triPt);      // 輪郭で面の切れ目を見せる（固定色＝高速）
+                // 1 枚が GDI+ に拒否されてもフレームを落とさない（座標ガードをすり抜けた異常値対策）
+                try { g.FillPolygon(_triBr, _triPt); g.DrawPolygon(_edgePen, _triPt); }
+                catch (Exception) { bad++; }
             }
+            if (bad > 0) PaintErr = "GDI+ が " + bad + " 枚の三角形を描けませんでした（座標異常）";
             g.SmoothingMode = sm;
         }
 
@@ -1611,13 +1961,15 @@ namespace SensorViewer
             foreach (int f in _order)
             {
                 int i0 = Faces[f, 0], i1 = Faces[f, 1], i2 = Faces[f, 2], i3 = Faces[f, 3];
+                if (!OkPt(_sx[i0], _sy[i0]) || !OkPt(_sx[i1], _sy[i1]) ||
+                    !OkPt(_sx[i2], _sy[i2]) || !OkPt(_sx[i3], _sy[i3])) continue;
                 double e1x = _rx[i1] - _rx[i0], e1y = _ry[i1] - _ry[i0], e1z = _rz[i1] - _rz[i0];
                 double e2x = _rx[i2] - _rx[i1], e2y = _ry[i2] - _ry[i1], e2z = _rz[i2] - _rz[i1];
                 double nx = e1y * e2z - e1z * e2y;
                 double ny = e1z * e2x - e1x * e2z;
                 double nz = e1x * e2y - e1y * e2x;
                 double nn = Math.Sqrt(nx * nx + ny * ny + nz * nz);
-                double lam = 0.35;
+                double lam = 0.58;
                 if (nn > 1e-9)
                 {
                     // 光は左上奥から（単位化済み: (0.40,0.56,0.73)）
@@ -1709,25 +2061,34 @@ namespace SensorViewer
             Color magCol;
             if (!MagHas) { magLine = "マグ未受信（方位コマなし）"; magCol = Color.FromArgb(230, 200, 120); }
             else if (MagYaw) { magLine = "マグ yaw 補正 ON    （M=切替 / N=方位リセット）"; magCol = Color.FromArgb(130, 220, 140); }
-            else { magLine = "マグ yaw 補正 OFF    （M=ON・現在は yaw がドリフトします）"; magCol = Color.FromArgb(230, 200, 120); }
+            else { magLine = "マグ yaw 補正 OFF（ハードアイアン大のため既定 OFF / M=ON）"; magCol = Color.FromArgb(230, 200, 120); }
             using (var sb = new SolidBrush(magCol)) g.DrawString(magLine, Font, sb, 10, 42);
 
             if (Calibrated)
             {
                 using (var cb = new SolidBrush(Color.FromArgb(120, 215, 135)))
-                    g.DrawString("キャリブ済み（C で今の向きを基準にし直し・位置も 0 に）", Font, cb, 10, 60);
+                    g.DrawString("キャリブ済み（C で位置・速度を 0 に。姿勢は変えません）", Font, cb, 10, 60);
             }
             else
             {
                 using (var pb = new SolidBrush(Color.FromArgb(255, 210, 90)))
-                    g.DrawString("▶ コントローラを水平に奥へ向けたまま構えたら C でキャリブレーション", Font, pb, 10, 60);
+                    g.DrawString("▶ 好きな向きで構えて C：位置・速度を 0 に（姿勢はそのまま）", Font, pb, 10, 60);
             }
             int yNext = 78;
-            if (FlipX || FlipY || FlipZ)
+            if (!string.IsNullOrEmpty(ImuNote))
+            {
+                using (var ib = new SolidBrush(ImuDone ? Color.FromArgb(150, 215, 160) : Color.FromArgb(235, 205, 120)))
+                    g.DrawString(ImuNote, Font, ib, 10, yNext);
+                yNext += 18;
+            }
+            if (FlipX || FlipY || FlipZ || NegAcc)
             {
                 string f = (FlipX ? "X " : "") + (FlipY ? "Y " : "") + (FlipZ ? "Z" : "");
+                string msg = "";
+                if (f.Length > 0) msg += "軸反転中: " + f + "（1 / 2 / 3 で解除）";
+                if (NegAcc) msg += (msg.Length > 0 ? "  /  " : "") + "加速度反転中（U で解除）";
                 using (var rb = new SolidBrush(Color.FromArgb(240, 120, 110)))
-                    g.DrawString("軸反転中: " + f + "（1 / 2 / 3 で解除）", Font, rb, 10, yNext);
+                    g.DrawString(msg, Font, rb, 10, yNext);
                 yNext += 18;
             }
             if (Model == null && !string.IsNullOrEmpty(ModelNote))
@@ -1766,7 +2127,7 @@ namespace SensorViewer
     {
         // 推定スケール（docs/spec §3-2 参照。未較正。実体は Consts）
         const double ACC_PER_G = Consts.AccPerG;        // 1g ≒ 49 万カウント
-        const double GYRO_PER_DPS = Consts.GyroPerDps;  // ±2000 deg/s 想定
+        const double GYRO_PER_DPS = Consts.GyroPerDps;  // 実測スケール（公称 ±2000deg/s 想定の 0.41 倍）
 
         readonly int _vid, _pid;
         Controller _dev;
@@ -1790,6 +2151,11 @@ namespace SensorViewer
         bool _biasInit;
         bool _calibrated;      // C キーで姿勢・位置の基準をとったか
         bool _flipX, _flipY, _flipZ;   // センサ軸の反転（鏡像是正用）
+        bool _negAcc;                  // 加速度だけ符号反転（上下の規約が逆だった場合の是正・U キー）
+        readonly ImuCalib _imu = new ImuCalib();
+        bool _imuApplied;      // 自動整合の結果を反映済みか
+        // 自動整合の結果は当面「診断表示のみ」。軸は素通し(+,+,+)、スケールは実測値で固定する。
+        const bool _imuApply = false;
         double[] _windowChoices = new double[3] { 2.0, 5.0, 10.0 };
         int _windowIdx = 1;
         double _reportHz, _tsRate;
@@ -1813,14 +2179,14 @@ namespace SensorViewer
             top.BackColor = Color.FromArgb(34, 37, 43);
             _btnPause = Btn("一時停止 (_Space)", delegate { TogglePause(); });
             _btnBias = Btn("ジャイロ基準化 (_B)", delegate { ReZero(); });
-            _btnCal = Btn("キャリブ (_C)", delegate { Calibrate(); });
+            _btnCal = Btn("位置0 (_C)", delegate { Calibrate(); });
             _btnWindow = Btn("表示窓 " + _windowChoices[_windowIdx].ToString("0") + "s (_W)", delegate { CycleWindow(); });
             _btnCsv = Btn("CSV 保存 (_S)", delegate { SaveCsv(); });
             int bx = 10;
             foreach (Button b in new Button[] { _btnPause, _btnBias, _btnCal, _btnWindow, _btnCsv })
             { b.Left = bx; b.Top = 7; top.Controls.Add(b); bx += b.Width + 8; }
             var lbl = new Label();
-            lbl.Text = "Space=停止  B=基準化  C=キャリブ  W=窓  S=CSV  R=姿勢リセット  1/2/3=軸反転  矢印/,, .=見立て  [ ]=感度  M/N=マグ  Esc=終了";
+            lbl.Text = "Space=停止  B=基準化  C=位置0  A=IMU整合やり直し  W=窓  S=CSV  R=姿勢リセット  1/2/3=軸反転  U=加速度反転  矢印/,, .=見立て  [ ]=感度  M/N=マグ  Esc=終了";
             lbl.AutoSize = true; lbl.ForeColor = Color.FromArgb(140, 145, 155);
             lbl.Location = new Point(bx + 8, 13);
             top.Controls.Add(lbl);
@@ -1828,7 +2194,7 @@ namespace SensorViewer
             // --- グラフ 3 枚 ---
             _acc = MakeChart("加速度", "g (推定)", "1g ≒ 49万 cts");
             _acc.UnitScale = 1.0 / ACC_PER_G;
-            _gyro = MakeChart("ジャイロ", "deg/s (推定)", "±2000deg/s 想定・基準化あり");
+            _gyro = MakeChart("ジャイロ", "deg/s (推定)", "実測スケール " + Consts.GyroPerDps.ToString("0") + " counts/(deg/s)・基準化あり");
             _gyro.UnitScale = 1.0 / GYRO_PER_DPS;
             _mag = MakeChart("コンパス（地磁気）", "count (未較正)", "姿勢でしか動きません");
             BindSeries();
@@ -1914,42 +2280,96 @@ namespace SensorViewer
         }
 
         // ---------------------------------------------------------------- 読み取りスレッド
+        /// <summary>自動整合の結果でジャイロ・磁気を「加速度基準の体座標」へ写す。
+        /// ジャイロは公称スケールへ正規化するので、以降の表示・積分は従来どおりでよい。</summary>
+        void MapImu(Sample s)
+        {
+            double k = (_imu.GyroPerDps > 100.0) ? Consts.GyroPerDps / _imu.GyroPerDps : 1.0;
+            double g0 = s.Gx, g1 = s.Gy, g2 = s.Gz;
+            s.Gx = (int)Math.Round(ImuCalib.Pick(g0, g1, g2, _imu.GyroPerm[0]) * _imu.GyroSgn[0] * k);
+            s.Gy = (int)Math.Round(ImuCalib.Pick(g0, g1, g2, _imu.GyroPerm[1]) * _imu.GyroSgn[1] * k);
+            s.Gz = (int)Math.Round(ImuCalib.Pick(g0, g1, g2, _imu.GyroPerm[2]) * _imu.GyroSgn[2] * k);
+            double m0 = s.Mx, m1 = s.My, m2 = s.Mz;
+            s.Mx = (int)Math.Round(ImuCalib.Pick(m0, m1, m2, _imu.MagPerm[0]) * _imu.MagSgn[0]);
+            s.My = (int)Math.Round(ImuCalib.Pick(m0, m1, m2, _imu.MagPerm[1]) * _imu.MagSgn[1]);
+            s.Mz = (int)Math.Round(ImuCalib.Pick(m0, m1, m2, _imu.MagPerm[2]) * _imu.MagSgn[2]);
+        }
+
+        /// <summary>自動整合が決まった直後の後始末（バイアス移し替え＋姿勢の作り直し）。</summary>
+        void ApplyImuOnce()
+        {
+            _imuApplied = true;
+            double k = (_imu.GyroPerDps > 100.0) ? Consts.GyroPerDps / _imu.GyroPerDps : 1.0;
+            double fx = _flipX ? -1.0 : 1.0, fy = _flipY ? -1.0 : 1.0, fz = _flipZ ? -1.0 : 1.0;
+            _biasX = fx * _imu.GyroSgn[0] * ImuCalib.Pick(_imu.RawBiasX, _imu.RawBiasY, _imu.RawBiasZ, _imu.GyroPerm[0]) * k;
+            _biasY = fy * _imu.GyroSgn[1] * ImuCalib.Pick(_imu.RawBiasX, _imu.RawBiasY, _imu.RawBiasZ, _imu.GyroPerm[1]) * k;
+            _biasZ = fz * _imu.GyroSgn[2] * ImuCalib.Pick(_imu.RawBiasX, _imu.RawBiasY, _imu.RawBiasZ, _imu.GyroPerm[2]) * k;
+            _biasInit = true;
+            _orient.SetBias(_biasX, _biasY, _biasZ);
+            _orient.Reset();
+            _orient.ResetMagRef();
+            _motion.Reset();
+            _calibrated = false;
+            if (!_imu.MagTrust) _orient.MagYaw = false;    // 磁気が信用できないときは yaw 補正を切る
+        }
+
+        // 読み取り側もネイティブ例外（hid.dll の破損状態例外など）でスレッドを失わないようにする。
+        [System.Runtime.ExceptionServices.HandleProcessCorruptedStateExceptions]
+        [System.Security.SecurityCritical]
         void ReaderLoop()
         {
             var sw = Stopwatch.StartNew();
             while (!_stop)
             {
-                if (!_dev.IsOpen)
+                try
                 {
-                    if (!_dev.Open()) { Thread.Sleep(800); continue; }
-                    lock (_sync) { /* 開き直し後の最初のレポート待ち */ }
-                }
-                int r = _dev.Read(60);
-                if (r > 0)
-                {
-                    Sample s = _dev.Decode(sw.Elapsed.TotalSeconds);
-                    // 軸反転（鏡像が正しくないときの是正。加速度・ジャイロ・コンパスをまとめて反転）
-                    if (_flipX) { s.Ax = -s.Ax; s.Gx = -s.Gx; s.Mx = -s.Mx; }
-                    if (_flipY) { s.Ay = -s.Ay; s.Gy = -s.Gy; s.My = -s.My; }
-                    if (_flipZ) { s.Az = -s.Az; s.Gz = -s.Gz; s.Mz = -s.Mz; }
-                    lock (_sync) { _ring.Push(s); }
-                    _orient.Update(s, Consts.GyroPerDps);        // サンプル毎に姿勢を積分（約165Hz）
-                    _motion.Update(s, _orient, ACC_PER_G);       // 続けて位置を積分（姿勢の重力除去に使う）
-                    // 静止検出（ZUPT）中はジャイロのバイアスをゆっくり自動追従する。
-                    // 使い回した後の「勝手に回り続ける」を自己回復させる（τ ≒ 1.5 秒）。
-                    if (_motion.Zupt)
+                    if (!_dev.IsOpen)
                     {
-                        _biasX += (s.Gx - _biasX) * 0.004;
-                        _biasY += (s.Gy - _biasY) * 0.004;
-                        _biasZ += (s.Gz - _biasZ) * 0.004;
-                        _biasInit = true;
-                        _orient.SetBias(_biasX, _biasY, _biasZ);
+                        if (!_dev.Open()) { Thread.Sleep(800); continue; }
+                        lock (_sync) { /* 開き直し後の最初のレポート待ち */ }
+                    }
+                    int r = _dev.Read(60);
+                    if (r > 0)
+                    {
+                        Sample s = _dev.Decode(sw.Elapsed.TotalSeconds);
+                        // IMU 自動整合（未判定のときだけ生データを集める）
+                        _imu.Push(s.T, s.Ax, s.Ay, s.Az, s.Gx, s.Gy, s.Gz, s.Mx, s.My, s.Mz);
+                        if (_imu.Done && _imuApply)              // 自動整合の適用（現在は診断のみ＝既定 off）
+                        {
+                            if (!_imuApplied) ApplyImuOnce();      // バイアス移し替え＋姿勢リセット（1 回だけ）
+                            MapImu(s);                            // ジャイロ・磁気を加速度基準の体座標へ写す
+                        }
+                        // 加速度だけ符号反転（「+g が上」の規約が逆のデバイス向け。姿勢と位置が鏡像になるとき用）
+                        if (_negAcc) { s.Ax = -s.Ax; s.Ay = -s.Ay; s.Az = -s.Az; }
+                        // 軸反転（鏡像が正しくないときの是正。加速度・ジャイロ・コンパスをまとめて反転）
+                        if (_flipX) { s.Ax = -s.Ax; s.Gx = -s.Gx; s.Mx = -s.Mx; }
+                        if (_flipY) { s.Ay = -s.Ay; s.Gy = -s.Gy; s.My = -s.My; }
+                        if (_flipZ) { s.Az = -s.Az; s.Gz = -s.Gz; s.Mz = -s.Mz; }
+                        lock (_sync) { _ring.Push(s); }
+                        _orient.Update(s, Consts.GyroPerDps);        // サンプル毎に姿勢を積分（約165Hz）
+                        _motion.Update(s, _orient, ACC_PER_G);       // 続けて位置を積分（姿勢の重力除去に使う）
+                        // 静止検出（ZUPT）中はジャイロのバイアスをゆっくり自動追従する。
+                        // 使い回した後の「勝手に回り続ける」を自己回復させる（τ ≒ 1.5 秒）。
+                        if (_motion.Zupt)
+                        {
+                            _biasX += (s.Gx - _biasX) * 0.004;
+                            _biasY += (s.Gy - _biasY) * 0.004;
+                            _biasZ += (s.Gz - _biasZ) * 0.004;
+                            _biasInit = true;
+                            _orient.SetBias(_biasX, _biasY, _biasZ);
+                        }
+                    }
+                    else if (_dev.LastErr != Nt.ERROR_TIMEOUT)
+                    {
+                        _dev.Close();     // 切断されたら探し直す
+                        Thread.Sleep(300);
                     }
                 }
-                else if (_dev.LastErr != Nt.ERROR_TIMEOUT)
+                catch (Exception ex)
                 {
-                    _dev.Close();     // 切断されたら探し直す
-                    Thread.Sleep(300);
+                    ErrLog.Log("reader", ex.GetType().Name + ": " + ex.Message + "\r\n" + ex);
+                    try { _dev.Close(); } catch { }
+                    Thread.Sleep(500);
                 }
             }
         }
@@ -2045,7 +2465,16 @@ namespace SensorViewer
             _info.BiasInit = _biasInit;
             _info.BiasX = _biasX; _info.BiasY = _biasY; _info.BiasZ = _biasZ;
 
-            if (!_dev.IsOpen) { _info.Status = "コントローラ未検出（再試行中）"; _info.StatusColor = Color.FromArgb(235, 120, 110); }
+            if (!_dev.IsOpen)
+            {
+                int le = _dev.LastErr;
+                _info.Status = (le == 5)
+                    ? "HID アクセス拒否（fix-hid-acl.ps1）"
+                    : (le == 1167
+                        ? "Bluetooth 応答なし（電源を入れ直し）"
+                        : "コントローラ未検出（再試行中）");
+                _info.StatusColor = Color.FromArgb(235, 120, 110);
+            }
             else if (_paused) { _info.Status = "一時停止中"; _info.StatusColor = Color.FromArgb(150, 200, 235); }
             else if (!has) { _info.Status = "受信待ち…"; _info.StatusColor = Color.FromArgb(230, 200, 120); }
             else if (!s.HasAcc && !s.HasGyro) { _info.Status = "IMU 停止（スリープ中）"; _info.StatusColor = Color.FromArgb(235, 120, 110); }
@@ -2066,8 +2495,13 @@ namespace SensorViewer
             _cube.Speed = msp; _cube.Zupt = mz;
             _cube.Calibrated = _calibrated;
             _cube.FlipX = _flipX; _cube.FlipY = _flipY; _cube.FlipZ = _flipZ;
+            _cube.NegAcc = _negAcc;
+            _cube.ImuNote = _imu.Report; _cube.ImuDone = _imu.Done;
+            _info.ImuNote = _imu.Report; _info.ImuDone = _imu.Done;
             _cube.Invalidate();
             _info.OrientYawDeg = _orient.YawDeg;
+            _info.OrientPitchDeg = _orient.PitchDeg;
+            _info.OrientRollDeg = _orient.RollDeg;
             _acc.Invalidate(); _gyro.Invalidate(); _mag.Invalidate(); _info.Invalidate();
         }
 
@@ -2104,12 +2538,14 @@ namespace SensorViewer
             else if (e.KeyCode == Keys.C) { Calibrate(); e.Handled = true; }
             else if (e.KeyCode == Keys.W) { CycleWindow(); e.Handled = true; }
             else if (e.KeyCode == Keys.S) { SaveCsv(); e.Handled = true; }
-            else if (e.KeyCode == Keys.R) { _orient.Reset(); _cube.OffYaw = _cube.OffPitch = _cube.OffRoll = 0; }
+            else if (e.KeyCode == Keys.R) { _orient.Reset(); _cube.OffYaw = CubeView.DefYaw; _cube.OffPitch = CubeView.DefPitch; _cube.OffRoll = CubeView.DefRoll; }
+            else if (e.KeyCode == Keys.U) { _negAcc = !_negAcc; ResetAll(); e.Handled = true; }
             else if (e.KeyCode == Keys.M) { _orient.MagYaw = !_orient.MagYaw; e.Handled = true; }
+            else if (e.KeyCode == Keys.A) { RestartImu(); e.Handled = true; }
             else if (e.KeyCode == Keys.N) { _orient.ResetMagRef(); e.Handled = true; }
-            else if (e.KeyCode == Keys.D1 || e.KeyCode == Keys.NumPad1) { _flipX = !_flipX; e.Handled = true; }
-            else if (e.KeyCode == Keys.D2 || e.KeyCode == Keys.NumPad2) { _flipY = !_flipY; e.Handled = true; }
-            else if (e.KeyCode == Keys.D3 || e.KeyCode == Keys.NumPad3) { _flipZ = !_flipZ; e.Handled = true; }
+            else if (e.KeyCode == Keys.D1 || e.KeyCode == Keys.NumPad1) { _flipX = !_flipX; ResetAll(); e.Handled = true; }
+            else if (e.KeyCode == Keys.D2 || e.KeyCode == Keys.NumPad2) { _flipY = !_flipY; ResetAll(); e.Handled = true; }
+            else if (e.KeyCode == Keys.D3 || e.KeyCode == Keys.NumPad3) { _flipZ = !_flipZ; ResetAll(); e.Handled = true; }
             else if (e.KeyCode == Keys.OemOpenBrackets) { _orient.GyroFactor = Math.Max(0.10, _orient.GyroFactor * 0.9); }
             else if (e.KeyCode == Keys.OemCloseBrackets) { _orient.GyroFactor = Math.Min(10.0, _orient.GyroFactor * 1.1); }
             else if (e.KeyCode == Keys.Left) { _cube.OffYaw -= 15; e.Handled = true; }
@@ -2140,11 +2576,31 @@ namespace SensorViewer
             _orient.SetBias(_biasX, _biasY, _biasZ);
         }
 
-        /// <summary>「この向きに構えて C」— 姿勢・位置・速度の基準をまとめてとる。</summary>
+        /// <summary>IMU 自動整合をやり直す（生データの収集から）。姿勢・位置も作り直す。</summary>
+        void RestartImu()
+        {
+            _imu.Restart();
+            _imuApplied = false;
+            _orient.Reset();
+            _motion.Reset();
+            _calibrated = false;
+        }
+
+        /// <summary>軸の反転（U / 1 / 2 / 3）を変えた直後の作り直し。基準（C）も取り直しになる。</summary>
+        void ResetAll()
+        {
+            ReZero();                       // 新しい軸の向きで静止バイアスを取り直す
+            _orient.Reset();                // 姿勢（クォータニオン）を捨てる
+            _orient.ResetMagRef();
+            _cube.OffYaw = CubeView.DefYaw; _cube.OffPitch = CubeView.DefPitch; _cube.OffRoll = CubeView.DefRoll;
+            _motion.Reset();
+            _calibrated = false;
+        }
+
+        /// <summary>C — 位置・速度を 0 にする。姿勢（向き）には触らない。</summary>
         void Calibrate()
         {
             ReZero();                      // ジャイロの静止バイアスを見直す（静止時が前提）
-            _orient.SetCalibration();      // いま向いている方角を identity にする
             _orient.ResetMagRef();         // マグの基準方位も今の世界に合わせ直す
             _motion.Reset();               // 位置・速度・軌跡をゼロに
             _calibrated = true;
@@ -2205,7 +2661,7 @@ namespace SensorViewer
         static int Main(string[] args)
         {
             int vid = 0x045E, pid = 0x065D;
-            double window = 5.0, selfTest = 0;
+            double window = 5.0, selfTest = 0, dumpSec = 0;
             string outPath = null;
             for (int i = 0; i < args.Length; i++)
             {
@@ -2214,8 +2670,10 @@ namespace SensorViewer
                 else if (a.Equals("-Pid", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) pid = Convert.ToInt32(args[++i], 0);
                 else if (a.Equals("-Window", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) window = double.Parse(args[++i], CultureInfo.InvariantCulture);
                 else if (a.Equals("-SelfTest", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) selfTest = double.Parse(args[++i], CultureInfo.InvariantCulture);
+                else if (a.Equals("-Dump", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) dumpSec = double.Parse(args[++i], CultureInfo.InvariantCulture);
                 else if (a.Equals("-Out", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) outPath = args[++i];
             }
+            if (dumpSec > 0) return RunDump(vid, pid, dumpSec, outPath);
             if (selfTest > 0) return RunSelfTest(vid, pid, selfTest, outPath);
 
             // UI スレッド例外は握ってログに残し、ウィンドウは生かし続ける（監視ツールなので止めたない）
@@ -2228,6 +2686,35 @@ namespace SensorViewer
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new MainForm(vid, pid, window));
+            return 0;
+        }
+
+        /// <summary>UI なしで生サンプルを CSV に出す（実機データのオフライン解析用）。</summary>
+        static int RunDump(int vid, int pid, double seconds, string outPath)
+        {
+            if (string.IsNullOrEmpty(outPath))
+                outPath = Path.Combine(Path.GetTempPath(), "sensor-viewer-dump.csv");
+            var dev = new Controller(vid, pid);
+            if (!dev.Open()) return 1;
+            var sb = new StringBuilder(1 << 20);
+            sb.AppendLine("t_us,ax,ay,az,gx,gy,gz,mx,my,mz,status,has");
+            var sw = Stopwatch.StartNew();
+            long n = 0;
+            while (sw.Elapsed.TotalSeconds < seconds)
+            {
+                if (dev.Read(60) <= 0) continue;
+                Sample s = dev.Decode(sw.Elapsed.TotalSeconds);
+                sb.Append((long)(s.T * 1e6)).Append(',')
+                  .Append(s.Ax).Append(',').Append(s.Ay).Append(',').Append(s.Az).Append(',')
+                  .Append(s.Gx).Append(',').Append(s.Gy).Append(',').Append(s.Gz).Append(',')
+                  .Append(s.Mx).Append(',').Append(s.My).Append(',').Append(s.Mz).Append(',')
+                  .Append(s.Status).Append(',')
+                  .Append((s.HasAcc ? 1 : 0) + (s.HasGyro ? 2 : 0) + (s.HasMag ? 4 : 0)).AppendLine();
+                n++;
+            }
+            dev.Dispose();
+            File.WriteAllText(outPath, sb.ToString(), new UTF8Encoding(false));
+            Console.WriteLine(outPath + "  " + n + " samples");
             return 0;
         }
 
@@ -2265,6 +2752,7 @@ namespace SensorViewer
             }
 
             var sw = Stopwatch.StartNew();
+            var imuCal = new ImuCalib();       // 実機データでの軸・スケール整合（動かしながら）
             long n = 0, accN = 0, gyroN = 0, magN = 0;
             var acc = new AxisStat(); var gyr = new AxisStat(); var mag = new AxisStat();
             double tempMin = double.MaxValue, tempMax = double.MinValue;
@@ -2279,6 +2767,9 @@ namespace SensorViewer
                 if (s.HasAcc) { accN++; acc.Add(s.Ax, s.Ay, s.Az); }
                 if (s.HasGyro) { gyroN++; gyr.Add(s.Gx, s.Gy, s.Gz); }
                 if (s.HasMag) { magN++; mag.Add(s.Mx, s.My, s.Mz); }
+                if (s.HasAcc && s.HasGyro)
+                    imuCal.Push(s.T, s.Ax, s.Ay, s.Az, s.Gx, s.Gy, s.Gz,
+                                s.HasMag ? s.Mx : 0.0, s.HasMag ? s.My : 0.0, s.HasMag ? s.Mz : 0.0);
                 if (s.Temp != 0) { double t = s.Temp / 100.0; if (t < tempMin) tempMin = t; if (t > tempMax) tempMax = t; }
                 if (ts0 == 0) ts0 = s.Ts; ts1 = s.Ts;
                 statusSeen[s.Status] = statusSeen.ContainsKey(s.Status) ? statusSeen[s.Status] + 1 : 1;
@@ -2298,6 +2789,10 @@ namespace SensorViewer
             if (ts1 > ts0) sb.AppendLine(string.Format("  ts 進み比     : {0:0.00} 倍（1.00 = 実時間と一致）", (ts1 - ts0) / 1e7 / el));
             var st = new List<int>(statusSeen.Keys); st.Sort();
             foreach (int k in st) sb.AppendLine(string.Format("  status flag {0}: {1} 回", k, statusSeen[k]));
+            sb.AppendLine();
+            sb.AppendLine("--- IMU 軸・スケール整合（実機データ・動かしながら） ---");
+            sb.AppendLine("  " + imuCal.Report);
+            if (!string.IsNullOrEmpty(imuCal.Detail)) sb.AppendLine("  " + imuCal.Detail);
             RunOrientTests(sb);
             return Finish(sb, outPath, n > 0 ? 0 : 1);
         }
@@ -2347,6 +2842,7 @@ namespace SensorViewer
                       (aEoff > 25.0) && (aEon < 6.0);
             sb.AppendLine(string.Format("  orient filter = {0}", ok ? "OK" : "NG"));
             RunMotionTests(sb);
+            RunImuCalibTests(sb);
         }
 
         /// <summary>位置推定（加速度の 2 重積分＋静止検出 ZUPT）の数値検証。実機が無くても実行できる。</summary>
@@ -2392,6 +2888,62 @@ namespace SensorViewer
             sb.AppendLine(string.Format(CultureInfo.InvariantCulture,
                 "  H ZUPT 停止     : 残移動 {0,9:0.00000} m（期待 ≒ 0 / 静止検出 {1}）", frozeGap, mG.Zupt ? "ON" : "OFF"));
             sb.AppendLine(string.Format("  motion = {0}", ok ? "OK" : "NG"));
+        }
+
+        /// <summary>IMU 軸・スケール自動整合の検証（合成データ）。</summary>
+        static void RunImuCalibTests(StringBuilder sb)
+        {
+            sb.AppendLine();
+            sb.AppendLine("--- IMU 軸・スケール自動整合の検証（合成データ） ---");
+            bool ok = true;
+            // 物理 X←生Y, 物理 Y←-生X, 物理 Z←生Z（並べ替え＋符号反転）＋公称スケール
+            ok &= RunImuCase(sb, new int[] { 1, 0, 2 }, new int[] { 1, -1, 1 }, 4194.0, "軸入替＋符号反転");
+            // 素通しだがスケールだけ違う
+            ok &= RunImuCase(sb, new int[] { 0, 1, 2 }, new int[] { 1, 1, 1 }, 3000.0, "素通し・別スケール");
+            sb.AppendLine(string.Format("  imu calib = {0}", ok ? "OK" : "NG"));
+        }
+
+        /// <summary>既定の対応 (tp,ts)・スケールで生データを作り、推定できるか確かめる。</summary>
+        static bool RunImuCase(StringBuilder sb, int[] tp, int[] ts, double truePerDps, string name)
+        {
+            var cal = new ImuCalib();
+            var rnd = new Random(12345);
+            double cPerCount = (Math.PI / 180.0) / truePerDps;         // [counts] → [rad/s]
+            double[] a = { 0.0, 0.0, 1.0 };                            // 体座標の上方向（単位）
+            double t = 0;
+            for (int i = 0; i < 1400; i++)
+            {
+                double dt = 1.0 / 165.0; t += dt;
+                double w0 = 1.1 * Math.Sin(i * 0.05);                  // 物理角速度 [rad/s]
+                double w1 = 0.9 * Math.Cos(i * 0.037);
+                double w2 = 0.7 * Math.Sin(i * 0.023);
+                // a を da/dt = -ω×a で更新（正規化して単位ベクトルを保つ）
+                double nx = a[0] + dt * -(w1 * a[2] - w2 * a[1]);
+                double ny = a[1] + dt * -(w2 * a[0] - w0 * a[2]);
+                double nz = a[2] + dt * -(w0 * a[1] - w1 * a[0]);
+                double nn = Math.Sqrt(nx * nx + ny * ny + nz * nz);
+                a = new double[] { nx / nn, ny / nn, nz / nn };
+                // 生ジャイロ: 物理 ω = s·raw[p] を逆に解く
+                double[] w = { w0, w1, w2 };
+                double[] raw = new double[3];
+                for (int j = 0; j < 3; j++) raw[tp[j]] = ts[j] * w[j] / cPerCount;
+                // 実機なみのノイズ
+                for (int j = 0; j < 3; j++) raw[j] += (rnd.NextDouble() - 0.5) * 3000.0;
+                double ax = a[0] * Consts.AccPerG + (rnd.NextDouble() - 0.5) * 800.0;
+                double ay = a[1] * Consts.AccPerG + (rnd.NextDouble() - 0.5) * 800.0;
+                double az = a[2] * Consts.AccPerG + (rnd.NextDouble() - 0.5) * 800.0;
+                cal.Push(t, ax, ay, az, raw[0], raw[1], raw[2], 0, 0, 0);
+            }
+            bool axes = cal.Done
+                && cal.GyroPerm[0] == tp[0] && cal.GyroPerm[1] == tp[1] && cal.GyroPerm[2] == tp[2]
+                && cal.GyroSgn[0] == ts[0] && cal.GyroSgn[1] == ts[1] && cal.GyroSgn[2] == ts[2];
+            double err = (cal.GyroPerDps - truePerDps) / truePerDps;
+            sb.AppendLine(string.Format(CultureInfo.InvariantCulture,
+                "  {0,-14}: 軸判定 {1} ({2} 期待 {3}) / スケール {4:0}（真 {5:0} / 誤差 {6:+0.0;-0.0;0.0}%）/ 残差 {7:0.0}%（素通し {8:0.0}%）",
+                name, axes ? "OK" : "NG", ImuCalib.MapText(cal.GyroPerm, cal.GyroSgn),
+                ImuCalib.MapText(tp, ts), cal.GyroPerDps, truePerDps, err * 100,
+                cal.GyroResid * 100, cal.GyroBaseResid * 100));
+            return axes && Math.Abs(err) < 0.05;
         }
 
         /// <summary>ジャイロに 1deg/s のバイアス＋体固定の磁気ベクトルを 30 秒与え、yaw のドリフト量を返す。</summary>
